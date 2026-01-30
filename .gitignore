@@ -1,0 +1,16 @@
+# Dataset directories
+humanml/
+KIT-ML/
+kit-ml-diffusion/
+
+# Dataset artifacts
+**/new_joint_vecs/
+**/texts/
+**/*.npy
+**/*.npz
+
+# Local notebooks and outputs
+.ipynb_checkpoints/
+
+# Model checkpoints
+checkpoints/

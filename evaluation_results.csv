@@ -1,0 +1,6 @@
+Metric,MDM Diffusion,MotionGPT,Real
+FID ↓,1.6919,0.6682,-
+Diversity ↑,3.8894,2.9426,3.4786
+Multimodality ↑,2.4448,0.9823,-
+Foot Skating ↓,nan,nan,nan
+Smoothness (Jerk) ↓,nan,nan,nan
