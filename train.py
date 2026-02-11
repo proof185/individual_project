@@ -1,5 +1,6 @@
 """Training script for composite motion generation."""
 
+import argparse
 import os
 import random
 from itertools import cycle
@@ -18,13 +19,19 @@ from models.diffusion import InbetweenDiffusion, InbetweenTransformer
 from utils import masked_mse, vel_loss, setup_clip_model, encode_text, prepare_gpt_batch
 
 
-def main():
+def main(stage: str):
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('device:', device)
     
-    cfg = CompositeConfig()
-    print(f"Keyframe interval: every {cfg.keyframe_interval} frames")
+    cfg = CompositeConfig(
+        keyframe_strategy='random',      # Switch to random
+        keyframe_min=3,                  # Min keyframes per sequence
+        keyframe_max=20,                 # Max keyframes per sequence
+        keyframe_include_ends=True,      # Always include first/last frame
+        # ... other params
+    )
+    print(f"Keyframe strategy: {cfg.keyframe_strategy}")
     
     # Load normalization statistics
     mean_path = os.path.join(cfg.root, 'Mean.npy')
@@ -108,13 +115,16 @@ def main():
     diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
     
     # Stage 1a: Train VQ-VAE
-    train_vqvae(vqvae, loader, cfg, device, mean, std)
+    if stage in {'all', 'vqvae'}:
+        train_vqvae(vqvae, loader, cfg, device, mean, std)
     
     # Stage 1b: Train GPT
-    train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device)
+    if stage in {'all', 'gpt'}:
+        train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device)
     
     # Stage 2: Train Diffusion In-betweening
-    train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std)
+    if stage in {'all', 'inbetween'}:
+        train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std)
     
     print("Training complete!")
 
@@ -333,4 +343,12 @@ def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb,
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Train composite motion models')
+    parser.add_argument(
+        '--stage',
+        choices=['all', 'vqvae', 'gpt', 'inbetween'],
+        default='all',
+        help='Training stage to run (default: all)'
+    )
+    args = parser.parse_args()
+    main(args.stage)
