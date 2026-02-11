@@ -19,7 +19,7 @@ from models.diffusion import InbetweenDiffusion, InbetweenTransformer
 from utils import masked_mse, vel_loss, setup_clip_model, encode_text, prepare_gpt_batch
 
 
-def main(stage: str):
+def main(stage: str, force_retrain: bool):
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('device:', device)
@@ -116,23 +116,23 @@ def main(stage: str):
     
     # Stage 1a: Train VQ-VAE
     if stage in {'all', 'vqvae'}:
-        train_vqvae(vqvae, loader, cfg, device, mean, std)
+        train_vqvae(vqvae, loader, cfg, device, mean, std, force_retrain)
     
     # Stage 1b: Train GPT
     if stage in {'all', 'gpt'}:
-        train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device)
+        train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device, force_retrain)
     
     # Stage 2: Train Diffusion In-betweening
     if stage in {'all', 'inbetween'}:
-        train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std)
+        train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std, force_retrain)
     
     print("Training complete!")
 
 
-def train_vqvae(vqvae, loader, cfg, device, mean, std):
+def train_vqvae(vqvae, loader, cfg, device, mean, std, force_retrain: bool = False):
     """Stage 1a: Train VQ-VAE."""
     vqvae_final_ckpt_path = f'checkpoints/composite_vqvae_step{cfg.vqvae_steps}.pt'
-    if os.path.exists(vqvae_final_ckpt_path):
+    if os.path.exists(vqvae_final_ckpt_path) and not force_retrain:
         print(f"Loading VQ-VAE from final checkpoint: {vqvae_final_ckpt_path}")
         vqvae_ckpt = torch.load(vqvae_final_ckpt_path, map_location=device)
         vqvae.load_state_dict(vqvae_ckpt['model'])
@@ -189,10 +189,10 @@ def train_vqvae(vqvae, loader, cfg, device, mean, std):
     print("VQ-VAE training complete!")
 
 
-def train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device):
+def train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device, force_retrain: bool = False):
     """Stage 1b: Train MotionGPT."""
     gpt_final_ckpt_path = f'checkpoints/composite_gpt_step{cfg.gpt_steps}.pt'
-    if os.path.exists(gpt_final_ckpt_path):
+    if os.path.exists(gpt_final_ckpt_path) and not force_retrain:
         print(f"Loading GPT from final checkpoint: {gpt_final_ckpt_path}")
         gpt_ckpt = torch.load(gpt_final_ckpt_path, map_location=device)
         gpt.load_state_dict(gpt_ckpt['gpt'])
@@ -255,10 +255,10 @@ def train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device):
     print("MotionGPT training complete!")
 
 
-def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std):
+def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std, force_retrain: bool = False):
     """Stage 2: Train Diffusion In-betweening."""
     inbetween_final_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
-    if os.path.exists(inbetween_final_ckpt_path):
+    if os.path.exists(inbetween_final_ckpt_path) and not force_retrain:
         print(f"Loading In-Betweening model from final checkpoint: {inbetween_final_ckpt_path}")
         inbetween_ckpt = torch.load(inbetween_final_ckpt_path, map_location=device)
         inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
@@ -350,5 +350,10 @@ if __name__ == '__main__':
         default='all',
         help='Training stage to run (default: all)'
     )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Force retraining even if final checkpoints exist'
+    )
     args = parser.parse_args()
-    main(args.stage)
+    main(args.stage, args.force)
