@@ -1,35 +1,4 @@
-# %% [markdown]
-# # Composite Model: Autoregressive + Diffusion In-Betweening
-# 
-# This notebook implements a **two-stage composite model** for text-to-motion generation:
-# 
-# ## Architecture Overview
-# 
-# **Stage 1: Autoregressive Keyframe Generation (MotionGPT-style)**
-# - VQ-VAE tokenizes motion into discrete codes
-# - GPT autoregressively generates motion tokens conditioned on text
-# - Generates sparse keyframes every `n=5` frames
-# 
-# **Stage 2: Diffusion In-Betweening (MDM-style)**
-# - Takes keyframes from Stage 1 as conditioning
-# - Uses diffusion to fill in intermediate frames
-# - Produces smooth, temporally coherent motion
-# 
-# ## Motivation
-# - **AR models** excel at generating coherent global structure and long-range dependencies
-# - **Diffusion models** excel at local refinement and smooth interpolation
-# - Combining both leverages the strengths of each approach
-# 
-# ## Pipeline
-# ```
-# Text → [CLIP] → [MotionGPT] → Sparse Keyframes (every n frames)
-#                                       ↓
-#                      [Diffusion In-Betweening Model]
-#                                       ↓
-#                             Full Dense Motion Sequence
-# ```
 
-# %%
 import os
 import math
 import random
@@ -43,15 +12,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+from itertools import cycle
+
 import clip
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('device:', device)
-
-# %%
-# -----------------------------
-# Config
-# -----------------------------
 
 @dataclass
 class CompositeConfig:
@@ -92,11 +58,6 @@ class CompositeConfig:
 cfg = CompositeConfig()
 print(f"Keyframe interval: every {cfg.keyframe_interval} frames")
 
-# %%
-# -----------------------------
-# Load dataset normalization stats
-# -----------------------------
-
 mean_path = os.path.join(cfg.root, 'Mean.npy')
 std_path  = os.path.join(cfg.root, 'Std.npy')
 
@@ -109,16 +70,7 @@ std  = std.view(-1)
 Fdim = mean.shape[0]
 print('Feature dim:', Fdim)
 
-# %%
-# -----------------------------
-# Dataset: HumanML3D with keyframe extraction for in-betweening
-# -----------------------------
-
 class HUMANML3DCompositeDataset(Dataset):
-    """
-    Dataset that provides both full motion and keyframe-extracted versions
-    for training the composite model.
-    """
     def __init__(
         self,
         root: str,
@@ -214,6 +166,7 @@ class HUMANML3DCompositeDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    # keyframes are not cached and are extrected each access - TODO: optimise by storing
     def __getitem__(self, idx):
         item = self.data[idx]
         motion = item['motion'].clone()
@@ -288,11 +241,6 @@ def collate_composite(batch: List[Dict]):
         'keyframe_indices': keyframe_indices,
     }
 
-# %%
-# -----------------------------
-# CLIP text encoder (frozen)
-# -----------------------------
-
 clip_model, _ = clip.load('ViT-B/32', device=device, jit=False)
 clip_model.eval()
 for p in clip_model.parameters():
@@ -308,11 +256,6 @@ def encode_text(texts: List[str], normalize: bool = True) -> torch.Tensor:
 
 empty_emb = encode_text(['']).squeeze(0)
 print('Empty embedding norm:', empty_emb.norm().item())
-
-# %%
-# -----------------------------
-# Create dataset
-# -----------------------------
 
 dataset = HUMANML3DCompositeDataset(
     cfg.root,
@@ -339,18 +282,7 @@ print('Motion:', batch['motion'].shape)
 print('Keyframes:', batch['keyframes'].shape)
 print('Keyframe indices sample:', batch['keyframe_indices'][0, :10])
 
-# %% [markdown]
-# ## Part 1: VQ-VAE for Motion Tokenization
-# 
-# The VQ-VAE discretizes continuous motion into tokens that the GPT can model.
-
-# %%
-# -----------------------------
-# VQ-VAE: Vector Quantization Variational Autoencoder
-# -----------------------------
-
 class VectorQuantizer(nn.Module):
-    """Vector Quantization with EMA codebook updates."""
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25, decay: float = 0.99):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -474,15 +406,6 @@ vqvae = MotionVQVAE(
 
 print(f'VQ-VAE params: {sum(p.numel() for p in vqvae.parameters())/1e6:.2f}M')
 
-# %% [markdown]
-# ## Part 2: MotionGPT for Autoregressive Generation
-# 
-# The GPT model generates motion tokens autoregressively, conditioned on text.
-
-# %%
-# -----------------------------
-# GPT Model: Autoregressive Motion Token Generation
-# -----------------------------
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, max_len: int = 1024):
@@ -540,7 +463,6 @@ class GPTBlock(nn.Module):
 
 
 class MotionGPT(nn.Module):
-    """GPT for autoregressive motion token generation."""
     def __init__(
         self,
         codebook_size: int,
@@ -681,28 +603,7 @@ gpt = MotionGPT(
 
 print(f'MotionGPT params: {sum(p.numel() for p in gpt.parameters())/1e6:.2f}M')
 
-# %% [markdown]
-# ## Part 3: Diffusion In-Betweening Model
-# 
-# This is the key new component: a diffusion model that takes sparse keyframes and fills in the intermediate frames.
-# 
-# **Architecture:**
-# - Input: Keyframe positions + noisy motion sequence
-# - Conditioning: Keyframe values are injected at their positions
-# - Output: Predicted clean motion (x0-prediction)
-# 
-# **Training:**
-# - During training, we extract keyframes from GT motion
-# - The model learns to reconstruct the full sequence from sparse keyframes
-# 
-# **Inference:**
-# - Keyframes come from the AR model
-# - Diffusion fills in the gaps
 
-# %%
-# -----------------------------
-# Diffusion Utilities
-# -----------------------------
 
 def cosine_beta_schedule(T: int, s: float = 0.008) -> torch.Tensor:
     steps = T + 1
@@ -712,12 +613,7 @@ def cosine_beta_schedule(T: int, s: float = 0.008) -> torch.Tensor:
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clamp(betas, 1e-5, 0.999)
 
-
 class InbetweenDiffusion:
-    """
-    Diffusion process for in-betweening.
-    Key difference: keyframes are kept fixed during sampling.
-    """
     def __init__(self, T: int):
         self.T = T
         betas = cosine_beta_schedule(T)
@@ -754,10 +650,6 @@ class InbetweenDiffusion:
         guidance_scale: float = 0.0,
         cond_uncond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Single denoising step with keyframe conditioning.
-        Keyframes are kept fixed (replaced after each step).
-        """
         B = xt.shape[0]
         t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
@@ -796,7 +688,6 @@ class InbetweenDiffusion:
         keyframe_indices: torch.Tensor,
         keyframe_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Replace positions in x with keyframe values."""
         B, T, F = x.shape
         x_out = x.clone()
 
@@ -821,9 +712,6 @@ class InbetweenDiffusion:
         guidance_scale: float = 2.5,
         cond_uncond: Optional[torch.Tensor] = None,
     ):
-        """
-        Full sampling loop for in-betweening.
-        """
         x = torch.randn(shape, device=device)
 
         # Initialize with keyframes
@@ -840,13 +728,7 @@ class InbetweenDiffusion:
 
         return x
 
-
 diff_inbetween = InbetweenDiffusion(cfg.T_diffusion)
-
-# %%
-# -----------------------------
-# In-Betweening Transformer Model
-# -----------------------------
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000):
     half = dim // 2
@@ -859,14 +741,6 @@ def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 1000
 
 
 class InbetweenTransformer(nn.Module):
-    """
-    Transformer for diffusion in-betweening.
-    
-    Key features:
-    - Accepts keyframe conditioning via special tokens
-    - Learns to interpolate between keyframes
-    - Predicts x0 (clean motion)
-    """
     def __init__(
         self,
         feature_dim: int,
@@ -941,18 +815,6 @@ class InbetweenTransformer(nn.Module):
         keyframe_indices: torch.Tensor,
         keyframe_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            xt: Noisy motion (B, T, F)
-            t: Diffusion timestep (B,)
-            cond: Text condition (B, cond_dim)
-            mask: Valid frame mask (B, T)
-            keyframes: Keyframe values (B, K, F)
-            keyframe_indices: Positions of keyframes (B, K)
-            keyframe_mask: Valid keyframe mask (B, K)
-        Returns:
-            x0_hat: Predicted clean motion (B, T, F)
-        """
         B, T, F = xt.shape
 
         # Create keyframe indicator for each frame
@@ -1013,14 +875,6 @@ inbetween_model = InbetweenTransformer(
 
 print(f'In-betweening model params: {sum(p.numel() for p in inbetween_model.parameters())/1e6:.2f}M')
 
-# %% [markdown]
-# ## Training Stage 1a: VQ-VAE
-
-# %%
-# -----------------------------
-# Training utilities
-# -----------------------------
-
 def masked_mse(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     m = mask.float().unsqueeze(-1)
     se = (a - b) ** 2
@@ -1034,13 +888,6 @@ def vel_loss(x: torch.Tensor, x_hat: torch.Tensor, mask: torch.Tensor) -> torch.
     v_gt = x[:, 1:] - x[:, :-1]
     v_pr = x_hat[:, 1:] - x_hat[:, :-1]
     return masked_mse(v_gt, v_pr, m)
-
-# %%
-# -----------------------------
-# Stage 1a: VQ-VAE Training
-# -----------------------------
-
-from itertools import cycle
 
 vqvae_optimizer = torch.optim.AdamW(vqvae.parameters(), lr=cfg.lr)
 
@@ -1101,14 +948,6 @@ else:
 
     print("VQ-VAE training complete!")
 
-# %% [markdown]
-# ## Training Stage 1b: MotionGPT
-
-# %%
-# -----------------------------
-# Stage 1b: GPT Training
-# -----------------------------
-
 def prepare_gpt_batch(batch, vqvae, downsample_rate):
     x = batch['motion'].to(device)
     mask = batch['mask'].to(device)
@@ -1133,11 +972,6 @@ def prepare_gpt_batch(batch, vqvae, downsample_rate):
     target_mask = torch.cat([token_mask, torch.ones(B, 1, dtype=torch.bool, device=device)], dim=1)
 
     return input_tokens, target_tokens, target_mask
-
-# %%
-# Load VQ-VAE checkpoint if needed
-# vqvae_ckpt = torch.load('checkpoints/composite_vqvae_step100000.pt', map_location=device)
-# vqvae.load_state_dict(vqvae_ckpt['model'])
 
 vqvae.eval()
 
@@ -1204,17 +1038,8 @@ else:
 
     print("MotionGPT training complete!")
 
-# %% [markdown]
-# ## Training Stage 2: Diffusion In-Betweening
-
-# %%
-# -----------------------------
-# Stage 2: Diffusion In-Betweening Training
-# -----------------------------
-
 inbetween_optimizer = torch.optim.AdamW(inbetween_model.parameters(), lr=cfg.lr)
 
-# Check if final checkpoint exists
 inbetween_final_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
 if os.path.exists(inbetween_final_ckpt_path):
     print(f"Loading In-Betweening model from final checkpoint: {inbetween_final_ckpt_path}")
@@ -1298,36 +1123,12 @@ else:
 
     print("Diffusion in-betweening training complete!")
 
-# %% [markdown]
-# ## Inference: Complete Pipeline
-# 
-# 1. Text → CLIP embedding
-# 2. CLIP embedding → MotionGPT → Sparse keyframes (every n frames)
-# 3. Keyframes → Diffusion In-Betweening → Full dense motion
-
-# %%
-# -----------------------------
-# Load checkpoints for inference
-# -----------------------------
-
-# Uncomment to load from checkpoints:
-# gpt_ckpt = torch.load('checkpoints/composite_gpt_step200000.pt', map_location=device)
-# vqvae.load_state_dict(gpt_ckpt['vqvae'])
-# gpt.load_state_dict(gpt_ckpt['gpt'])
-
-# inbetween_ckpt = torch.load('checkpoints/composite_inbetween_step200000.pt', map_location=device)
-# inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
 
 vqvae.eval()
 gpt.eval()
 inbetween_model.eval()
 
 print("Models loaded for inference")
-
-# %%
-# -----------------------------
-# Composite Generation Pipeline
-# -----------------------------
 
 @torch.no_grad()
 def generate_composite(
