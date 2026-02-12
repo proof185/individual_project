@@ -19,9 +19,9 @@ class CompositeConfig:
 
     # In-betweening config
     keyframe_interval: int = 5   # Generate keyframe every n frames
-    keyframe_strategy: str = 'interval'  # 'interval' or 'random'
+    keyframe_strategy: str = 'random'  # 'interval' or 'random'
     keyframe_count: int | None = None  # If set, number of random keyframes
-    keyframe_min: int = 6  # Min random keyframes when keyframe_count is None
+    keyframe_min: int = 3  # Min random keyframes when keyframe_count is None
     keyframe_max: int = 20  # Max random keyframes when keyframe_count is None
     keyframe_include_ends: bool = True  # Always include first/last frame
 

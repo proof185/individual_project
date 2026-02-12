@@ -294,7 +294,12 @@ def generate_ar_only(
 def main():
     """Example usage."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfg = CompositeConfig()
+    
+    cfg = CompositeConfig(
+        keyframe_strategy='random',
+        keyframe_max=20,
+        keyframe_min=3,
+    )
     
     # Load models
     vqvae, gpt, inbetween_model, diff_inbetween, clip_model, mean, std, Fdim = load_models(cfg, device)
@@ -310,6 +315,9 @@ def main():
         prompt,
         length=120,
         keyframe_interval=cfg.keyframe_interval,
+        keyframe_strategy=cfg.keyframe_strategy,
+        keyframe_min=cfg.keyframe_min,
+        keyframe_max=cfg.keyframe_max,
         device=device,
     )
     

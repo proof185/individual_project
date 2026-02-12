@@ -161,7 +161,6 @@ def animate_skeleton(
         return [pts] + lines
     
     anim = FuncAnimation(fig, update, frames=T, init_func=init, interval=interval, blit=False)
-    plt.close(fig)
     return anim
 
 

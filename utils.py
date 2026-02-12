@@ -24,6 +24,17 @@ def vel_loss(x: torch.Tensor, x_hat: torch.Tensor, mask: torch.Tensor) -> torch.
     return masked_mse(v_gt, v_pr, m)
 
 
+def jerk_loss(x_hat: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Jerk loss - penalizes sudden changes in acceleration (third derivative)."""
+    # Jerk = third derivative (change in acceleration)
+    vel = torch.diff(x_hat, dim=1)          # (B, T-1, F)
+    accel = torch.diff(vel, dim=1)          # (B, T-2, F)
+    jerk = torch.diff(accel, dim=1)         # (B, T-3, F)
+    jerk_mask = mask[:, 3:]
+    # Penalize non-zero jerk
+    return masked_mse(torch.zeros_like(jerk), jerk, jerk_mask)
+
+
 def setup_clip_model(device: str = 'cuda'):
     """Load and setup CLIP model for text encoding."""
     clip_model, _ = clip.load('ViT-B/32', device=device, jit=False)

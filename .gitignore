@@ -12,5 +12,11 @@ kit-ml-diffusion/
 # Local notebooks and outputs
 .ipynb_checkpoints/
 
-# Model checkpoints
-checkpoints/
+# Model checkpoints - keep only latest for each model
+checkpoints/*.pt
+!checkpoints/composite_vqvae_step100000.pt
+!checkpoints/composite_gpt_step200000.pt
+!checkpoints/composite_inbetween_step200000.pt
+!checkpoints/motiongpt_humanml3d_step200000.pt
+!checkpoints/motiongpt_humanml3d_step160000.pt
+!checkpoints/mdm_humanml3d_jointvecs_step200000.pt
