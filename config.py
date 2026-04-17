@@ -24,6 +24,14 @@ class CompositeConfig:
     keyframe_min: int = 3  # Min random keyframes when keyframe_count is None
     keyframe_max: int = 20  # Max random keyframes when keyframe_count is None
     keyframe_include_ends: bool = True  # Always include first/last frame
+    inbetween_velocity_weight: float = 0.75
+    boundary_velocity_weight: float = 1.0
+    boundary_acceleration_weight: float = 0.25
+    transition_consistency_weight: float = 0.75
+    transition_window: int = 4
+    transition_sigma: float = 1.5
+    transition_velocity_weight: float = 1.0
+    transition_acceleration_weight: float = 0.5
 
     # VQ-VAE
     codebook_size: int = 512

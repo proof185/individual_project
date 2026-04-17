@@ -16,7 +16,16 @@ from dataset import HUMANML3DCompositeDataset, collate_composite
 from models.vqvae import MotionVQVAE
 from models.gpt import MotionGPT
 from models.diffusion import InbetweenDiffusion, InbetweenTransformer
-from utils import masked_mse, vel_loss, setup_clip_model, encode_text, prepare_gpt_batch, jerk_loss
+from utils import (
+    boundary_acceleration_loss,
+    boundary_velocity_loss,
+    encode_text,
+    masked_mse,
+    prepare_gpt_batch,
+    setup_clip_model,
+    transition_consistency_loss,
+    vel_loss,
+)
 
 
 def main(stage: str, force_retrain: bool):
@@ -311,43 +320,34 @@ def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb,
             valid_idx = keyframe_indices[b][valid]
             non_keyframe_mask[b, valid_idx] = False
         
-        # Main reconstruction loss on in-between frames
+        # Main reconstruction loss on in-between frames.
         loss = masked_mse(x0, x0_hat, non_keyframe_mask)
-        
-        # IMPORTANT: Strongly enforce smoothness at keyframe boundaries
-        # Predict should smoothly interpolate between keyframes
-        boundary_loss = 0.0
-        boundary_weight = 1.0
-        for b in range(B):
-            valid = keyframe_mask[b]
-            valid_idx = keyframe_indices[b][valid].cpu().numpy()
-            if len(valid_idx) > 1:
-                for i in range(len(valid_idx) - 1):
-                    kf_start = int(valid_idx[i])
-                    kf_end = int(valid_idx[i+1])
-                    if kf_end > kf_start + 1:
-                        # Frames between keyframes should interpolate smoothly
-                        segment = x0_hat[b, kf_start:kf_end+1]
-                        # Check that in-between frames are "between" the keyframes
-                        kf_start_pos = x0[b, kf_start:kf_start+1]
-                        kf_end_pos = x0[b, kf_end:kf_end+1]
-                        
-                        # Interpolation constraint: frame_i should be closer to both keyframes
-                        for t_idx in range(kf_start + 1, kf_end):
-                            alpha = (t_idx - kf_start) / (kf_end - kf_start)
-                            expected = (1 - alpha) * kf_start_pos + alpha * kf_end_pos
-                            boundary_loss += torch.nn.functional.mse_loss(segment[t_idx - kf_start], expected.squeeze())
-        
-        if boundary_loss > 0:
-            loss = loss + boundary_weight * boundary_loss
-        
-        # Velocity smoothness (strong weight - key for smooth interpolation)
-        v_loss_val = vel_loss(x0, x0_hat, mask) * 2.0  # Increased from 0.5
+
+        # Encourage smooth entry/exit around keyframes without forcing the
+        # entire segment into a linear interpolation that flattens jumps.
+        boundary_vel = boundary_velocity_loss(x0, x0_hat, mask, keyframe_indices, keyframe_mask)
+        loss = loss + cfg.boundary_velocity_weight * boundary_vel
+
+        boundary_accel = boundary_acceleration_loss(x0, x0_hat, mask, keyframe_indices, keyframe_mask)
+        loss = loss + cfg.boundary_acceleration_weight * boundary_accel
+
+        # Keep a light global velocity term to avoid drift, but do not over-smooth.
+        v_loss_val = vel_loss(x0, x0_hat, mask) * cfg.inbetween_velocity_weight
         loss = loss + v_loss_val
-        
-        # Jerk smoothness (penalize sudden changes in acceleration)
-        jerk_loss_val = jerk_loss(x0_hat, mask) * 1.0
-        loss = loss + jerk_loss_val
+
+        # Replace global jerk regularization with keyframe-local transition matching.
+        transition_loss_val = transition_consistency_loss(
+            x0,
+            x0_hat,
+            mask,
+            keyframe_indices,
+            keyframe_mask,
+            window=cfg.transition_window,
+            sigma=cfg.transition_sigma,
+            velocity_weight=cfg.transition_velocity_weight,
+            acceleration_weight=cfg.transition_acceleration_weight,
+        )
+        loss = loss + cfg.transition_consistency_weight * transition_loss_val
         
         inbetween_optimizer.zero_grad(set_to_none=True)
         loss.backward()
