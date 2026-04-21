@@ -33,6 +33,10 @@ parser.add_argument('--load-results', action='store_true',
                     help='Load previous results from evaluation_results.csv')
 parser.add_argument('--num-samples', type=int, default=256,
                     help='Number of samples for evaluation')
+parser.add_argument('--composite-gpt-steps', type=int, default=None,
+                    help='Override composite GPT checkpoint step for evaluation')
+parser.add_argument('--composite-inbetween-steps', type=int, default=None,
+                    help='Override composite in-betweening checkpoint step for evaluation')
 args = parser.parse_args()
 
 # Parse which models to evaluate
@@ -77,6 +81,10 @@ class EvalConfig:
     commitment_cost: float = 0.25
 
 cfg = EvalConfig()
+if args.composite_gpt_steps is not None:
+    cfg.composite_gpt_steps = int(args.composite_gpt_steps)
+if args.composite_inbetween_steps is not None:
+    cfg.composite_inbetween_steps = int(args.composite_inbetween_steps)
 
 # Load normalization stats
 mean = torch.from_numpy(np.load(os.path.join(cfg.root, 'Mean.npy'))).float().view(-1)
@@ -752,17 +760,28 @@ def generate_mdm(prompts: List[str], lengths: List[int], guidance_scale: float =
     if mdm_model is None:
         return []
     
+    global cuda_poisoned
     mdm_model.eval()
     results = []
     
     for prompt, length in tqdm(zip(prompts, lengths), total=len(prompts), desc='MDM Generation'):
-        mask = torch.ones(1, length, dtype=torch.bool, device=device)
-        cond = encode_text([prompt])
-        cond_uncond = encode_text([''])
-        
-        x_norm = diffusion.sample(mdm_model, (1, length, Fdim), cond, mask, guidance_scale, cond_uncond)
-        x = x_norm[0].cpu() * (std + 1e-8) + mean
-        results.append(x)
+        if cuda_poisoned:
+            break
+        try:
+            mask = torch.ones(1, length, dtype=torch.bool, device=device)
+            cond = encode_text([prompt])
+            cond_uncond = encode_text([''])
+
+            x_norm = diffusion.sample(mdm_model, (1, length, Fdim), cond, mask, guidance_scale, cond_uncond)
+            x = x_norm[0].cpu() * (std + 1e-8) + mean
+            results.append(x)
+        except Exception as e:
+            err_str = str(e)
+            print(f'MDM generation error for "{prompt}": {err_str}')
+            if 'device-side assert' in err_str or 'AcceleratorError' in err_str or 'CUDA' in err_str:
+                print('CUDA context corrupted — stopping MDM generation early.')
+                cuda_poisoned = True
+            continue
     
     return results
 
@@ -774,11 +793,14 @@ def generate_motiongpt(prompts: List[str], lengths: List[int], guidance_scale: f
     if gpt_model is None or vqvae is None:
         return []
     
+    global cuda_poisoned
     gpt_model.eval()
     vqvae.eval()
     results = []
     
     for prompt, length in tqdm(zip(prompts, lengths), total=len(prompts), desc='MotionGPT Generation'):
+        if cuda_poisoned:
+            break
         try:
             cond = encode_text([prompt])
             cond_uncond = encode_text([''])
@@ -788,6 +810,10 @@ def generate_motiongpt(prompts: List[str], lengths: List[int], guidance_scale: f
             motion = torch.randn(length, Fdim) * std.unsqueeze(0) + mean.unsqueeze(0)
             results.append(motion)
         except Exception as e:
+            err_str = str(e)
+            if 'device-side assert' in err_str or 'AcceleratorError' in err_str or 'CUDA' in err_str:
+                print('CUDA context corrupted — stopping MotionGPT generation early.')
+                cuda_poisoned = True
             continue
     
     return results
@@ -799,8 +825,12 @@ def generate_composite_model(prompts: List[str], lengths: List[int], guidance_sc
     if composite_vqvae is None or composite_gpt is None or composite_inbetween is None:
         return []
     
+    global cuda_poisoned
     results = []
+    cuda_ok = True
     for prompt, length in tqdm(zip(prompts, lengths), total=len(prompts), desc='Composite Generation'):
+        if not cuda_ok:
+            break
         try:
             motion_unnorm, _, _ = generate_composite(
                 composite_vqvae, composite_gpt, composite_inbetween, composite_diffusion, clip_model,
@@ -813,12 +843,20 @@ def generate_composite_model(prompts: List[str], lengths: List[int], guidance_sc
             )
             results.append(motion_unnorm)
         except Exception as e:
-            print(f'Error generating for "{prompt}": {e}')
+            err_str = str(e)
+            print(f'Error generating for "{prompt}": {err_str}')
+            if 'device-side assert' in err_str or 'AcceleratorError' in err_str or 'CUDA' in err_str:
+                # CUDA context is now corrupted; stop generating to avoid cascading failures.
+                print('CUDA context corrupted — stopping composite generation early.')
+                cuda_ok = False
+                cuda_poisoned = True
             continue
     
     return results
 
 print('Generation functions defined')
+
+cuda_poisoned = False
 
 # Sample from test set
 num_eval = min(cfg.num_samples, len(test_dataset))
@@ -960,10 +998,20 @@ gpt_mm_samples = []
 comp_mm_samples = []
 
 for text, length in tqdm(zip(mm_texts, mm_lengths), total=len(mm_texts), desc='Multimodality samples'):
-    # Generate multiple samples per text
-    mdm_samples = generate_mdm([text] * cfg.num_samples_per_text, [length] * cfg.num_samples_per_text, cfg.guidance_scale)
-    gpt_samples = generate_motiongpt([text] * cfg.num_samples_per_text, [length] * cfg.num_samples_per_text, cfg.guidance_scale)
-    comp_samples = generate_composite_model([text] * cfg.num_samples_per_text, [length] * cfg.num_samples_per_text, cfg.guidance_scale)
+    if cuda_poisoned:
+        print('Skipping remaining multimodality generation due to CUDA context corruption.')
+        break
+    # Generate multiple samples per text only for selected models.
+    mdm_samples = []
+    gpt_samples = []
+    comp_samples = []
+
+    if 'mdm' in selected_models:
+        mdm_samples = generate_mdm([text] * cfg.num_samples_per_text, [length] * cfg.num_samples_per_text, cfg.guidance_scale)
+    if 'gpt' in selected_models:
+        gpt_samples = generate_motiongpt([text] * cfg.num_samples_per_text, [length] * cfg.num_samples_per_text, cfg.guidance_scale)
+    if 'composite' in selected_models:
+        comp_samples = generate_composite_model([text] * cfg.num_samples_per_text, [length] * cfg.num_samples_per_text, cfg.guidance_scale)
     
     if len(mdm_samples) > 0:
         mdm_mm_samples.append(mdm_samples)
@@ -972,13 +1020,13 @@ for text, length in tqdm(zip(mm_texts, mm_lengths), total=len(mm_texts), desc='M
     if len(comp_samples) > 0:
         comp_mm_samples.append(comp_samples)
 
-mdm_mm = compute_multimodality(mdm_mm_samples) if len(mdm_mm_samples) > 0 else (
+mdm_mm = compute_multimodality(mdm_mm_samples) if ('mdm' in selected_models and len(mdm_mm_samples) > 0) else (
     float(previous_results['MDM Diffusion']['Multimodality ↑']) if 'MDM Diffusion' in previous_results and 'Multimodality ↑' in previous_results['MDM Diffusion'] else float('nan')
 )
-gpt_mm = compute_multimodality(gpt_mm_samples) if len(gpt_mm_samples) > 0 else (
+gpt_mm = compute_multimodality(gpt_mm_samples) if ('gpt' in selected_models and len(gpt_mm_samples) > 0) else (
     float(previous_results['MotionGPT']['Multimodality ↑']) if 'MotionGPT' in previous_results and 'Multimodality ↑' in previous_results['MotionGPT'] else float('nan')
 )
-comp_mm = compute_multimodality(comp_mm_samples) if len(comp_mm_samples) > 0 else (
+comp_mm = compute_multimodality(comp_mm_samples) if ('composite' in selected_models and len(comp_mm_samples) > 0) else (
     float(previous_results['Composite']['Multimodality ↑']) if 'Composite' in previous_results and 'Multimodality ↑' in previous_results['Composite'] else float('nan')
 )
 
@@ -1017,10 +1065,11 @@ comp_r = compute_r_precision(composite_motions, eval_texts) if len(composite_mot
 
 for k in [1, 2, 3]:
     metric = f'R@{k} ↑'
+    key = f'R@{k}'
     results['Metric'].append(metric)
-    results['MDM Diffusion'].append(f"{mdm_r['R@{k}']:.4f}" if not np.isnan(mdm_r[f'R@{k}']) else 'nan')
-    results['MotionGPT'].append(f"{gpt_r['R@{k}']:.4f}" if not np.isnan(gpt_r[f'R@{k}']) else 'nan')
-    results['Composite'].append(f"{comp_r['R@{k}']:.4f}" if not np.isnan(comp_r[f'R@{k}']) else 'nan')
+    results['MDM Diffusion'].append(f"{mdm_r[key]:.4f}" if not np.isnan(mdm_r[key]) else 'nan')
+    results['MotionGPT'].append(f"{gpt_r[key]:.4f}" if not np.isnan(gpt_r[key]) else 'nan')
+    results['Composite'].append(f"{comp_r[key]:.4f}" if not np.isnan(comp_r[key]) else 'nan')
     results['Real'].append('-')
 
 

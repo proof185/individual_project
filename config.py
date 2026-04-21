@@ -33,6 +33,17 @@ class CompositeConfig:
     transition_velocity_weight: float = 1.0
     transition_acceleration_weight: float = 0.5
 
+    # Learnable keyframe selector (upstream mask generator)
+    use_learned_keyframe_selector: bool = True
+    selector_d_model: int = 256
+    selector_layers: int = 4
+    selector_heads: int = 4
+    selector_dropout: float = 0.1
+    selector_threshold: float = 0.5
+    selector_target_ratio: float = 0.12
+    selector_budget_weight: float = 2.0
+    selector_entropy_weight: float = 0.02
+
     # VQ-VAE
     codebook_size: int = 512
     codebook_dim: int = 512

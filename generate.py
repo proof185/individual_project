@@ -9,7 +9,7 @@ import torch
 from config import CompositeConfig
 from models.vqvae import MotionVQVAE
 from models.gpt import MotionGPT
-from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+from models.diffusion import InbetweenDiffusion, InbetweenTransformer, KeyframeSelector
 from utils import setup_clip_model, encode_text
 
 
@@ -65,6 +65,22 @@ def load_models(cfg: CompositeConfig, device: str = 'cuda'):
     if os.path.exists(inbetween_ckpt_path):
         inbetween_ckpt = torch.load(inbetween_ckpt_path, map_location=device)
         inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
+        selector_state = inbetween_ckpt.get('selector')
+        if cfg.use_learned_keyframe_selector and selector_state is not None:
+            selector_model = KeyframeSelector(
+                feature_dim=Fdim,
+                cond_dim=512,
+                d_model=cfg.d_model,
+                n_layers=cfg.selector_layers,
+                n_heads=cfg.selector_heads,
+                dropout=cfg.selector_dropout,
+                max_len=cfg.max_len + 10,
+                threshold=cfg.selector_threshold,
+            ).to(device)
+            selector_model.load_state_dict(selector_state)
+            selector_model.eval()
+            inbetween_model.keyframe_selector = selector_model
+            print('Loaded learned keyframe selector from in-betweening checkpoint')
         print(f"Loaded in-betweening model from {inbetween_ckpt_path}")
     
     # Set to eval mode
@@ -145,6 +161,7 @@ def generate_composite(
     ar_guidance_scale: float = 2.5,
     # Diffusion params
     diff_guidance_scale: float = 2.5,
+    use_learned_selector: bool | None = None,
     device: str = 'cuda',
 ):
     """
@@ -201,21 +218,44 @@ def generate_composite(
     
     # Decode tokens to continuous motion
     ar_motion_norm = vqvae.decode_indices(tokens)  # (1, T_decoded, F)
-    ar_motion_norm = ar_motion_norm[0, :length]    # (T, F)
+    ar_motion_norm = ar_motion_norm[0]             # (T_decoded, F)
+
+    # GPT may emit EOS early, yielding fewer frames than requested.
+    # Use the effective decoded length for downstream keyframe indexing.
+    effective_length = min(length, ar_motion_norm.shape[0])
+    if effective_length <= 0:
+        raise RuntimeError('Composite AR stage produced empty motion.')
+    ar_motion_norm = ar_motion_norm[:effective_length]  # (T_eff, F)
     
     print(f"AR output shape: {ar_motion_norm.shape}")
     
-    # Extract sparse keyframes from AR output
-    keyframe_indices = _select_keyframe_indices(
-        length=length,
-        keyframe_interval=keyframe_interval,
-        strategy=strategy,
-        keyframe_count=k_count,
-        keyframe_min=k_min,
-        keyframe_max=k_max,
-        include_ends=include_ends,
-    )
-    keyframe_indices = torch.tensor(keyframe_indices, dtype=torch.long, device=device)
+    use_selector = cfg.use_learned_keyframe_selector if use_learned_selector is None else use_learned_selector
+    selector_model = getattr(inbetween_model, 'keyframe_selector', None)
+
+    if use_selector and selector_model is not None:
+        selector_model.eval()
+        selector_valid = torch.ones(1, effective_length, dtype=torch.bool, device=device)
+        _, selector_mask_st = selector_model(
+            ar_motion_norm.unsqueeze(0),
+            selector_valid,
+            cond=cond,
+        )
+        keyframe_indices = torch.nonzero(selector_mask_st[0] > 0.5, as_tuple=False).squeeze(1)
+        if keyframe_indices.numel() == 0:
+            keyframe_indices = torch.tensor([0, effective_length - 1], dtype=torch.long, device=device)
+        print(f"Selected {int(keyframe_indices.numel())} keyframes with learned selector")
+    else:
+        # Extract sparse keyframes from AR output
+        keyframe_indices = _select_keyframe_indices(
+            length=effective_length,
+            keyframe_interval=keyframe_interval,
+            strategy=strategy,
+            keyframe_count=k_count,
+            keyframe_min=k_min,
+            keyframe_max=k_max,
+            include_ends=include_ends,
+        )
+        keyframe_indices = torch.tensor(keyframe_indices, dtype=torch.long, device=device)
     
     keyframes = ar_motion_norm[keyframe_indices]  # (K, F)
     print(f"Extracted {len(keyframe_indices)} keyframes at positions: {keyframe_indices.tolist()[:10]}...")
@@ -224,7 +264,7 @@ def generate_composite(
     print("\nStage 2: Filling in-between frames with diffusion...")
     
     # Prepare for diffusion
-    B, T, F = 1, length, Fdim
+    B, T, F = 1, effective_length, Fdim
     mask = torch.ones(B, T, dtype=torch.bool, device=device)
     
     keyframes_batch = keyframes.unsqueeze(0)  # (1, K, F)

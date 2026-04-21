@@ -15,7 +15,7 @@ from config import CompositeConfig
 from dataset import HUMANML3DCompositeDataset, collate_composite
 from models.vqvae import MotionVQVAE
 from models.gpt import MotionGPT
-from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+from models.diffusion import InbetweenDiffusion, InbetweenTransformer, KeyframeSelector
 from utils import (
     boundary_acceleration_loss,
     boundary_velocity_loss,
@@ -25,10 +25,17 @@ from utils import (
     setup_clip_model,
     transition_consistency_loss,
     vel_loss,
+    weighted_masked_mse,
 )
 
 
-def main(stage: str, force_retrain: bool):
+def main(
+    stage: str,
+    force_retrain: bool,
+    vqvae_steps: int | None = None,
+    gpt_steps: int | None = None,
+    inbetween_steps: int | None = None,
+):
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('device:', device)
@@ -40,6 +47,12 @@ def main(stage: str, force_retrain: bool):
         keyframe_include_ends=True,      # Always include first/last frame
         # ... other params
     )
+    if vqvae_steps is not None:
+        cfg.vqvae_steps = int(vqvae_steps)
+    if gpt_steps is not None:
+        cfg.gpt_steps = int(gpt_steps)
+    if inbetween_steps is not None:
+        cfg.inbetween_steps = int(inbetween_steps)
     print(f"Keyframe strategy: {cfg.keyframe_strategy}")
     
     # Load normalization statistics
@@ -120,6 +133,20 @@ def main(stage: str, force_retrain: bool):
         max_len=cfg.max_len + 10,
     ).to(device)
     print(f'In-betweening model params: {sum(p.numel() for p in inbetween_model.parameters())/1e6:.2f}M')
+
+    keyframe_selector = None
+    if cfg.use_learned_keyframe_selector:
+        keyframe_selector = KeyframeSelector(
+            feature_dim=Fdim,
+            cond_dim=512,
+            d_model=cfg.selector_d_model,
+            n_layers=cfg.selector_layers,
+            n_heads=cfg.selector_heads,
+            dropout=cfg.selector_dropout,
+            max_len=cfg.max_len + 10,
+            threshold=cfg.selector_threshold,
+        ).to(device)
+        print(f'Keyframe selector params: {sum(p.numel() for p in keyframe_selector.parameters())/1e6:.2f}M')
     
     diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
     
@@ -133,7 +160,19 @@ def main(stage: str, force_retrain: bool):
     
     # Stage 2: Train Diffusion In-betweening
     if stage in {'all', 'inbetween'}:
-        train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std, force_retrain)
+        train_inbetween(
+            inbetween_model,
+            diff_inbetween,
+            loader,
+            dataset,
+            empty_emb,
+            cfg,
+            device,
+            mean,
+            std,
+            force_retrain,
+            keyframe_selector=keyframe_selector,
+        )
     
     print("Training complete!")
 
@@ -194,6 +233,14 @@ def train_vqvae(vqvae, loader, cfg, device, mean, std, force_retrain: bool = Fal
                 'step': step,
             }, f'checkpoints/composite_vqvae_step{step}.pt')
             print('Saved VQ-VAE checkpoint')
+
+    os.makedirs('checkpoints', exist_ok=True)
+    torch.save({
+        'model': vqvae.state_dict(),
+        'optimizer': vqvae_optimizer.state_dict(),
+        'step': cfg.vqvae_steps,
+    }, vqvae_final_ckpt_path)
+    print(f'Saved final VQ-VAE checkpoint: {vqvae_final_ckpt_path}')
     
     print("VQ-VAE training complete!")
 
@@ -260,26 +307,89 @@ def train_gpt(vqvae, gpt, loader, dataset, empty_emb, cfg, device, force_retrain
                 'step': step,
             }, f'checkpoints/composite_gpt_step{step}.pt')
             print('Saved GPT checkpoint')
+
+    os.makedirs('checkpoints', exist_ok=True)
+    torch.save({
+        'gpt': gpt.state_dict(),
+        'vqvae': vqvae.state_dict(),
+        'optimizer': gpt_optimizer.state_dict(),
+        'step': cfg.gpt_steps,
+    }, gpt_final_ckpt_path)
+    print(f'Saved final GPT checkpoint: {gpt_final_ckpt_path}')
     
     print("MotionGPT training complete!")
 
 
-def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb, cfg, device, mean, std, force_retrain: bool = False):
+def _frame_mask_to_sparse_keyframes(
+    x0: torch.Tensor,
+    frame_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+):
+    """Convert per-frame keyframe mask (B, T) into padded sparse keyframe tensors."""
+    B, T, F = x0.shape
+    hard_mask = (frame_mask > 0.5) & valid_mask
+
+    key_idx_list = []
+    keyframe_list = []
+    for b in range(B):
+        idx = torch.nonzero(hard_mask[b], as_tuple=False).squeeze(1)
+        if idx.numel() == 0:
+            idx = torch.tensor([0], device=x0.device, dtype=torch.long)
+        key_idx_list.append(idx)
+        keyframe_list.append(x0[b, idx])
+
+    K_max = max(idx.numel() for idx in key_idx_list)
+    keyframes = torch.zeros(B, K_max, F, device=x0.device, dtype=x0.dtype)
+    keyframe_indices = torch.zeros(B, K_max, device=x0.device, dtype=torch.long)
+    keyframe_mask = torch.zeros(B, K_max, device=x0.device, dtype=torch.bool)
+
+    for b, (idx, kf) in enumerate(zip(key_idx_list, keyframe_list)):
+        K = idx.numel()
+        keyframes[b, :K] = kf
+        keyframe_indices[b, :K] = idx
+        keyframe_mask[b, :K] = True
+
+    return keyframes, keyframe_indices, keyframe_mask
+
+
+def train_inbetween(
+    inbetween_model,
+    diff_inbetween,
+    loader,
+    dataset,
+    empty_emb,
+    cfg,
+    device,
+    mean,
+    std,
+    force_retrain: bool = False,
+    keyframe_selector=None,
+):
     """Stage 2: Train Diffusion In-betweening."""
     inbetween_final_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
     if os.path.exists(inbetween_final_ckpt_path) and not force_retrain:
         print(f"Loading In-Betweening model from final checkpoint: {inbetween_final_ckpt_path}")
         inbetween_ckpt = torch.load(inbetween_final_ckpt_path, map_location=device)
         inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
+        if keyframe_selector is not None and 'selector' in inbetween_ckpt:
+            keyframe_selector.load_state_dict(inbetween_ckpt['selector'])
         print("Diffusion in-betweening training already complete! Loaded from checkpoint.")
         return
     
-    inbetween_optimizer = torch.optim.AdamW(inbetween_model.parameters(), lr=cfg.lr)
+    params = list(inbetween_model.parameters())
+    if keyframe_selector is not None:
+        params += list(keyframe_selector.parameters())
+    inbetween_optimizer = torch.optim.AdamW(params, lr=cfg.lr)
     
     inbetween_model.train()
+    if keyframe_selector is not None:
+        keyframe_selector.train()
     data_iter = cycle(loader)
     
-    print(f"Stage 2: Training Diffusion In-Betweening (keyframe interval={cfg.keyframe_interval})...")
+    if keyframe_selector is not None:
+        print(f"Stage 2: Training Diffusion In-Betweening with LEARNED keyframe selector (target ratio={cfg.selector_target_ratio})...")
+    else:
+        print(f"Stage 2: Training Diffusion In-Betweening (keyframe interval={cfg.keyframe_interval})...")
     
     for step in range(1, cfg.inbetween_steps + 1):
         batch = next(data_iter)
@@ -306,22 +416,64 @@ def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb,
         noise = torch.randn_like(x0)
         xt = diff_inbetween.q_sample(x0, t, noise)
         xt = xt * mask.float().unsqueeze(-1)
-        
-        # Replace keyframe positions with clean values (they're given)
-        xt = diff_inbetween._replace_keyframes(xt, keyframes, keyframe_indices, keyframe_mask)
-        
-        # Predict x0
-        x0_hat = inbetween_model(xt, t, cond, mask, keyframes, keyframe_indices, keyframe_mask)
-        
-        # Loss on non-keyframe positions (keyframes are given, no need to predict)
-        non_keyframe_mask = mask.clone()
-        for b in range(B):
-            valid = keyframe_mask[b]
-            valid_idx = keyframe_indices[b][valid]
-            non_keyframe_mask[b, valid_idx] = False
-        
-        # Main reconstruction loss on in-between frames.
-        loss = masked_mse(x0, x0_hat, non_keyframe_mask)
+
+        selector_ratio = None
+        selector_budget_loss = x0.new_tensor(0.0)
+        selector_entropy_loss = x0.new_tensor(0.0)
+
+        if keyframe_selector is not None:
+            selector_probs, selector_mask_st = keyframe_selector(x0, mask, cond=cond)
+            keyframe_canvas = selector_mask_st.unsqueeze(-1) * x0
+
+            xt = diff_inbetween._replace_keyframes(
+                xt,
+                observation_mask=selector_mask_st,
+                keyframe_canvas=keyframe_canvas,
+            )
+            x0_hat = inbetween_model(
+                xt,
+                t,
+                cond,
+                mask,
+                observation_mask=selector_mask_st,
+                keyframe_canvas=keyframe_canvas,
+            )
+
+            # Train diffusion to reconstruct mostly where selector did not observe.
+            non_keyframe_weights = (1.0 - selector_mask_st) * mask.float()
+            loss = weighted_masked_mse(x0, x0_hat, non_keyframe_weights, mask)
+
+            selector_ratio = (selector_probs * mask.float()).sum() / (mask.float().sum() + 1e-8)
+            selector_budget_loss = (selector_ratio - cfg.selector_target_ratio) ** 2
+            p = selector_probs.clamp(1e-6, 1 - 1e-6)
+            entropy = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
+            selector_entropy_loss = (entropy * mask.float()).sum() / (mask.float().sum() + 1e-8)
+            loss = (
+                loss
+                + cfg.selector_budget_weight * selector_budget_loss
+                + cfg.selector_entropy_weight * selector_entropy_loss
+            )
+
+            # Boundary / transition losses use hard keyframe indices for locality.
+            keyframes, keyframe_indices, keyframe_mask = _frame_mask_to_sparse_keyframes(
+                x0,
+                selector_mask_st.detach(),
+                mask,
+            )
+        else:
+            # Replace keyframe positions with clean values (they're given).
+            xt = diff_inbetween._replace_keyframes(xt, keyframes, keyframe_indices, keyframe_mask)
+
+            # Predict x0.
+            x0_hat = inbetween_model(xt, t, cond, mask, keyframes, keyframe_indices, keyframe_mask)
+
+            # Loss on non-keyframe positions (keyframes are given, no need to predict).
+            non_keyframe_mask = mask.clone()
+            for b in range(B):
+                valid = keyframe_mask[b]
+                valid_idx = keyframe_indices[b][valid]
+                non_keyframe_mask[b, valid_idx] = False
+            loss = masked_mse(x0, x0_hat, non_keyframe_mask)
 
         # Encourage smooth entry/exit around keyframes without forcing the
         # entire segment into a linear interpolation that flattens jumps.
@@ -355,17 +507,36 @@ def train_inbetween(inbetween_model, diff_inbetween, loader, dataset, empty_emb,
         inbetween_optimizer.step()
         
         if step % 200 == 0:
-            print(f"step {step:>7d} | loss {loss.item():.5f}")
+            if selector_ratio is None:
+                print(f"step {step:>7d} | loss {loss.item():.5f}")
+            else:
+                print(
+                    f"step {step:>7d} | loss {loss.item():.5f} | "
+                    f"sel_ratio {selector_ratio.item():.4f} | "
+                    f"sel_budget {selector_budget_loss.item():.5f} | "
+                    f"sel_entropy {selector_entropy_loss.item():.5f}"
+                )
         
         if step % 10_000 == 0:
             os.makedirs('checkpoints', exist_ok=True)
             torch.save({
                 'inbetween': inbetween_model.state_dict(),
+                'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
                 'optimizer': inbetween_optimizer.state_dict(),
                 'step': step,
                 'cfg': cfg.__dict__,
             }, f'checkpoints/composite_inbetween_step{step}.pt')
             print('Saved in-betweening checkpoint')
+
+    os.makedirs('checkpoints', exist_ok=True)
+    torch.save({
+        'inbetween': inbetween_model.state_dict(),
+        'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
+        'optimizer': inbetween_optimizer.state_dict(),
+        'step': cfg.inbetween_steps,
+        'cfg': cfg.__dict__,
+    }, inbetween_final_ckpt_path)
+    print(f'Saved final in-betweening checkpoint: {inbetween_final_ckpt_path}')
     
     print("Diffusion in-betweening training complete!")
 
@@ -383,5 +554,14 @@ if __name__ == '__main__':
         action='store_true',
         help='Force retraining even if final checkpoints exist'
     )
+    parser.add_argument('--vqvae-steps', type=int, default=None, help='Override VQ-VAE training steps')
+    parser.add_argument('--gpt-steps', type=int, default=None, help='Override GPT training steps')
+    parser.add_argument('--inbetween-steps', type=int, default=None, help='Override in-betweening training steps')
     args = parser.parse_args()
-    main(args.stage, args.force)
+    main(
+        args.stage,
+        args.force,
+        vqvae_steps=args.vqvae_steps,
+        gpt_steps=args.gpt_steps,
+        inbetween_steps=args.inbetween_steps,
+    )

@@ -184,7 +184,9 @@ class MotionGPT(nn.Module):
             result.append(seq)
 
         max_len = max(len(s) for s in result) if result else 0
-        padded = torch.full((B, max_len), self.pad_token, dtype=torch.long, device=device)
+        # Use 0 (a valid codebook index) as pad so decode_indices never gets an
+        # out-of-range index that triggers a CUDA device-side assert.
+        padded = torch.zeros((B, max_len), dtype=torch.long, device=device)
         for i, seq in enumerate(result):
             if len(seq) > 0:
                 padded[i, :len(seq)] = seq

@@ -87,14 +87,24 @@ class InbetweenDiffusion:
     def build_observation_mask(
         self,
         x: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframe_indices: Optional[torch.Tensor] = None,
+        keyframe_mask: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Build a feature-level observation mask from per-frame keyframe indices.
 
         Output shape: (B, T, F), with 1 where the keyframe is observed.
         """
         B, T, F = x.shape
+
+        if observation_mask is not None:
+            if observation_mask.ndim != 2:
+                raise ValueError("observation_mask must have shape (B, T).")
+            return observation_mask.float().unsqueeze(-1).expand(B, T, F)
+
+        if keyframe_indices is None or keyframe_mask is None:
+            raise ValueError("Either observation_mask or keyframe tensors must be provided.")
+
         obs = torch.zeros(B, T, F, device=x.device, dtype=x.dtype)
 
         for b in range(B):
@@ -108,30 +118,55 @@ class InbetweenDiffusion:
     def masked_mix(
         self,
         xt: torch.Tensor,
-        keyframes: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframes: Optional[torch.Tensor] = None,
+        keyframe_indices: Optional[torch.Tensor] = None,
+        keyframe_mask: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
+        keyframe_canvas: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute x_t_tilde = m * c + (1 - m) * x_t and return (x_t_tilde, m)."""
-        obs_mask = self.build_observation_mask(xt, keyframe_indices, keyframe_mask)
-        xt_tilde = xt.clone()
+        obs_mask = self.build_observation_mask(
+            xt,
+            keyframe_indices=keyframe_indices,
+            keyframe_mask=keyframe_mask,
+            observation_mask=observation_mask,
+        )
 
-        for b in range(xt.shape[0]):
-            valid = keyframe_mask[b]
-            if valid.any():
-                idx = keyframe_indices[b][valid].long()
-                xt_tilde[b, idx] = keyframes[b][valid]
+        if keyframe_canvas is not None:
+            if keyframe_canvas.shape != xt.shape:
+                raise ValueError("keyframe_canvas must have the same shape as xt.")
+            canvas = keyframe_canvas
+        else:
+            if keyframes is None or keyframe_indices is None or keyframe_mask is None:
+                raise ValueError("Sparse keyframe tensors are required when keyframe_canvas is not provided.")
+            canvas = torch.zeros_like(xt)
+            for b in range(xt.shape[0]):
+                valid = keyframe_mask[b]
+                if valid.any():
+                    idx = keyframe_indices[b][valid].long()
+                    canvas[b, idx] = keyframes[b][valid]
+
+        xt_tilde = obs_mask * canvas + (1.0 - obs_mask) * xt
 
         return xt_tilde, obs_mask
 
     def _replace_keyframes(
         self,
         x: torch.Tensor,
-        keyframes: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframes: Optional[torch.Tensor] = None,
+        keyframe_indices: Optional[torch.Tensor] = None,
+        keyframe_mask: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
+        keyframe_canvas: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Hard replace constrained frames with their given values."""
+        if observation_mask is not None and keyframe_canvas is not None:
+            obs = observation_mask.float().unsqueeze(-1)
+            return obs * keyframe_canvas + (1.0 - obs) * x
+
+        if keyframes is None or keyframe_indices is None or keyframe_mask is None:
+            raise ValueError("Sparse keyframe tensors are required when dense masks are not provided.")
+
         x_out = x.clone()
         for b in range(x.shape[0]):
             valid = keyframe_mask[b]
@@ -147,9 +182,11 @@ class InbetweenDiffusion:
         t_batch: torch.Tensor,
         cond: torch.Tensor,
         mask: torch.Tensor,
-        keyframes: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframes: Optional[torch.Tensor],
+        keyframe_indices: Optional[torch.Tensor],
+        keyframe_mask: Optional[torch.Tensor],
+        observation_mask: Optional[torch.Tensor] = None,
+        keyframe_canvas: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Model predicts x0 from masked noisy input."""
         return model(
@@ -160,6 +197,8 @@ class InbetweenDiffusion:
             keyframes,
             keyframe_indices,
             keyframe_mask,
+            observation_mask=observation_mask,
+            keyframe_canvas=keyframe_canvas,
         )
 
     @torch.no_grad()
@@ -170,11 +209,13 @@ class InbetweenDiffusion:
         t: int,
         cond: torch.Tensor,
         mask: torch.Tensor,
-        keyframes: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframes: Optional[torch.Tensor] = None,
+        keyframe_indices: Optional[torch.Tensor] = None,
+        keyframe_mask: Optional[torch.Tensor] = None,
         guidance_scale: float = 0.0,
         cond_uncond: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
+        keyframe_canvas: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Single reverse diffusion step.
 
@@ -187,23 +228,36 @@ class InbetweenDiffusion:
         t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)
 
         # Paper-style: mask current x_t with observations before prediction.
-        xt_tilde, _ = self.masked_mix(xt, keyframes, keyframe_indices, keyframe_mask)
+        xt_tilde, _ = self.masked_mix(
+            xt,
+            keyframes=keyframes,
+            keyframe_indices=keyframe_indices,
+            keyframe_mask=keyframe_mask,
+            observation_mask=observation_mask,
+            keyframe_canvas=keyframe_canvas,
+        )
         xt_tilde = xt_tilde * mask.float().unsqueeze(-1)
 
         if guidance_scale > 0.0 and cond_uncond is not None:
             x0_uncond = self._predict_x0(
                 model, xt_tilde, t_batch, cond_uncond, mask,
-                keyframes, keyframe_indices, keyframe_mask
+                keyframes, keyframe_indices, keyframe_mask,
+                observation_mask=observation_mask,
+                keyframe_canvas=keyframe_canvas,
             )
             x0_cond = self._predict_x0(
                 model, xt_tilde, t_batch, cond, mask,
-                keyframes, keyframe_indices, keyframe_mask
+                keyframes, keyframe_indices, keyframe_mask,
+                observation_mask=observation_mask,
+                keyframe_canvas=keyframe_canvas,
             )
             x0_hat = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
         else:
             x0_hat = self._predict_x0(
                 model, xt_tilde, t_batch, cond, mask,
-                keyframes, keyframe_indices, keyframe_mask
+                keyframes, keyframe_indices, keyframe_mask,
+                observation_mask=observation_mask,
+                keyframe_canvas=keyframe_canvas,
             )
 
         beta_t = self.betas[t]
@@ -213,7 +267,14 @@ class InbetweenDiffusion:
         if t == 0:
             x_prev = x0_hat
             # Exact final adherence helps downstream use.
-            x_prev = self._replace_keyframes(x_prev, keyframes, keyframe_indices, keyframe_mask)
+            x_prev = self._replace_keyframes(
+                x_prev,
+                keyframes=keyframes,
+                keyframe_indices=keyframe_indices,
+                keyframe_mask=keyframe_mask,
+                observation_mask=observation_mask,
+                keyframe_canvas=keyframe_canvas,
+            )
         else:
             alpha_bar_prev = self.alpha_bar[t - 1]
             coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
@@ -233,11 +294,13 @@ class InbetweenDiffusion:
         shape: Tuple[int, int, int],
         cond: torch.Tensor,
         mask: torch.Tensor,
-        keyframes: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframes: Optional[torch.Tensor] = None,
+        keyframe_indices: Optional[torch.Tensor] = None,
+        keyframe_mask: Optional[torch.Tensor] = None,
         guidance_scale: float = 2.5,
         cond_uncond: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
+        keyframe_canvas: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Full reverse process."""
         x = torch.randn(shape, device=self.device)
@@ -255,12 +318,98 @@ class InbetweenDiffusion:
                 keyframe_mask=keyframe_mask,
                 guidance_scale=guidance_scale,
                 cond_uncond=cond_uncond,
+                observation_mask=observation_mask,
+                keyframe_canvas=keyframe_canvas,
             )
 
         # Ensure exact keyframes in returned sample.
-        x = self._replace_keyframes(x, keyframes, keyframe_indices, keyframe_mask)
+        x = self._replace_keyframes(
+            x,
+            keyframes=keyframes,
+            keyframe_indices=keyframe_indices,
+            keyframe_mask=keyframe_mask,
+            observation_mask=observation_mask,
+            keyframe_canvas=keyframe_canvas,
+        )
         x = x * mask.float().unsqueeze(-1)
         return x
+
+
+class KeyframeSelector(nn.Module):
+    """Predict a binary frame mask for keyframe conditioning.
+
+    Uses a straight-through estimator so the forward pass is binary while
+    gradients flow through probabilities from the diffusion objective.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        cond_dim: int = 512,
+        d_model: int = 256,
+        n_layers: int = 4,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        max_len: int = 256,
+        threshold: float = 0.5,
+    ):
+        super().__init__()
+        self.threshold = threshold
+        self.frame_in = nn.Linear(feature_dim, d_model)
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cond_dim, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.out = nn.Linear(d_model, 1)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+    def forward(
+        self,
+        motion: torch.Tensor,
+        valid_mask: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, T, _ = motion.shape
+        if T > self.pos_emb.shape[1]:
+            raise ValueError(f"Sequence length {T} exceeds selector max_len {self.pos_emb.shape[1]}.")
+
+        h = self.frame_in(motion) + self.pos_emb[:, :T, :]
+        if cond is not None:
+            h = h + self.cond_mlp(cond).unsqueeze(1)
+
+        h = self.encoder(h, src_key_padding_mask=~valid_mask)
+        logits = self.out(h).squeeze(-1)
+        probs = torch.sigmoid(logits) * valid_mask.float()
+
+        hard = (probs > self.threshold).float()
+
+        # Always preserve start/end observations on each valid sequence.
+        endpoint_mask = torch.zeros_like(hard)
+        has_valid = valid_mask.any(dim=1)
+        if has_valid.any():
+            batch_idx = torch.arange(B, device=motion.device)[has_valid]
+            last_idx = valid_mask.long().sum(dim=1).clamp(min=1) - 1
+            endpoint_mask[batch_idx, 0] = 1.0
+            endpoint_mask[batch_idx, last_idx[batch_idx]] = 1.0
+
+        probs = torch.maximum(probs, endpoint_mask)
+        hard = torch.maximum(hard, endpoint_mask)
+
+        st_mask = hard + probs - probs.detach()
+        st_mask = st_mask * valid_mask.float()
+        return probs, st_mask
 
 
 class InbetweenTransformer(nn.Module):
@@ -364,9 +513,11 @@ class InbetweenTransformer(nn.Module):
         t: torch.Tensor,
         cond: torch.Tensor,
         mask: torch.Tensor,
-        keyframes: torch.Tensor,
-        keyframe_indices: torch.Tensor,
-        keyframe_mask: torch.Tensor,
+        keyframes: Optional[torch.Tensor] = None,
+        keyframe_indices: Optional[torch.Tensor] = None,
+        keyframe_mask: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
+        keyframe_canvas: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, T, F = xt.shape
         if F != self.feature_dim:
@@ -378,8 +529,19 @@ class InbetweenTransformer(nn.Module):
                 f"Sequence length {T} exceeds max_len {self.pos_emb.shape[1]}."
             )
 
-        obs_mask = self._build_observation_mask(xt, keyframe_indices, keyframe_mask)
-        keyframe_canvas = self._build_keyframe_canvas(xt, keyframes, keyframe_indices, keyframe_mask)
+        if observation_mask is not None:
+            obs_mask = observation_mask.float().unsqueeze(-1).expand(B, T, F)
+        else:
+            if keyframe_indices is None or keyframe_mask is None:
+                raise ValueError("Either observation_mask or sparse keyframe tensors must be provided.")
+            obs_mask = self._build_observation_mask(xt, keyframe_indices, keyframe_mask)
+
+        if keyframe_canvas is None:
+            if keyframes is None or keyframe_indices is None or keyframe_mask is None:
+                raise ValueError("Either keyframe_canvas or sparse keyframe tensors must be provided.")
+            keyframe_canvas = self._build_keyframe_canvas(xt, keyframes, keyframe_indices, keyframe_mask)
+        elif keyframe_canvas.shape != xt.shape:
+            raise ValueError("keyframe_canvas must have shape (B, T, F).")
 
         # CondMDI masked addition:
         # x_t_tilde = m * c + (1 - m) * x_t
