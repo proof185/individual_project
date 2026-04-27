@@ -1,25 +1,3 @@
-"""CondMDI-style diffusion models for motion in-betweening.
-
-This is a drop-in replacement for the previous diffusion.py that moves the
-in-betweening model closer to the conditioning scheme in:
-
-  Flexible Motion In-betweening with Diffusion Models (CondMDI)
-
-Key changes relative to the previous version:
-- uses masked noisy input x_t_tilde = m * c + (1 - m) * x_t inside the model
-- concatenates the observation mask to the model input
-- predicts x0 (sample-estimation parameterization)
-- uses CFG the same way as before
-- keeps the same public API so train.py does not need to change
-
-Important note:
-- With the current train.py / dataset interface, keyframes are still whole-frame
-  constraints rather than arbitrary partial-joint constraints.
-- This file supports feature-level masks internally, but the provided training
-  pipeline currently broadcasts keyframes over all features at the selected
-  frames.
-"""
-
 import math
 from typing import Optional, Tuple
 

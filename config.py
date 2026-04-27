@@ -9,12 +9,12 @@ class CompositeConfig:
     split: str = 'train'
     max_len: int = 196
     batch_size: int = 32
-    num_workers: int = 0
+    num_workers: int = 4
 
     lr: float = 1e-4
-    vqvae_steps: int = 100_000   # Stage 1a: VQ-VAE training
-    gpt_steps: int = 200_000     # Stage 1b: GPT training
-    inbetween_steps: int = 200_000  # Stage 2: Diffusion in-betweening
+    vqvae_steps: int = 50_000    # Stage 1a: VQ-VAE training
+    gpt_steps: int = 100_000     # Stage 1b: GPT training
+    inbetween_steps: int = 100_000  # Stage 2: Diffusion in-betweening
     grad_clip: float = 1.0
 
     # In-betweening config
@@ -58,7 +58,7 @@ class CompositeConfig:
     guidance_scale: float = 2.5
 
     # Model dimensions
-    d_model: int = 512
-    n_layers: int = 8
+    d_model: int = 256
+    n_layers: int = 6
     n_heads: int = 8
     dropout: float = 0.1
