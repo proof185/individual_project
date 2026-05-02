@@ -35,7 +35,7 @@ def _qrot(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return (v + 2 * (q[:, :1] * uv + uuv)).view(original_shape)
 
 
-def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
+def recover_from_ric(data: np.ndarray, joints_num: int = 22, add_root_y_to_joints: bool = False) -> np.ndarray:
     """
     Recover 3D joint positions from root-relative representation.
     
@@ -68,6 +68,8 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     positions = _qrot(_qinv(r_rot_quat[..., None, :]).expand(positions.shape[:-1] + (4,)), positions)
     positions[..., 0] += r_pos[..., 0:1]
     positions[..., 2] += r_pos[..., 2:3]
+    if add_root_y_to_joints:
+        positions[..., 1] += r_pos[..., 1:2]
     joints = torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
     return joints.cpu().numpy()
 
@@ -174,6 +176,7 @@ def visualize_motion_file(
     show_html: bool = True,
     center: bool = True,
     bounds_percentile: float = 1.0,
+    add_root_y_to_joints: bool = False,
 ):
     """
     Load and visualize motion from file.
@@ -201,7 +204,7 @@ def visualize_motion_file(
         print(f"Loaded joint-positions motion: {joints.shape}")
     else:
         # HumanML3D 263-dim feature vectors (T, F)
-        joints = recover_from_ric(vecs, joints_num=22)
+        joints = recover_from_ric(vecs, joints_num=22, add_root_y_to_joints=add_root_y_to_joints)
         print(f"Loaded motion (recovered from features): {joints.shape}")
     
     anim = animate_skeleton(
@@ -220,15 +223,23 @@ def visualize_motion_file(
 
 
 def main():
-    """Example usage."""
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python visualize.py <motion_file.npy>")
-        return
-    
-    filepath = sys.argv[1]
-    anim = visualize_motion_file(filepath, show_html=False)
+    """Command-line visualization utility."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Visualize motion .npy files")
+    parser.add_argument("motion_file", type=str, help="Path to motion .npy file")
+    parser.add_argument(
+        "--add-root-y",
+        action="store_true",
+        help="Add root Y to non-root joints during RIC decode (debug for AR feature conventions)",
+    )
+    args = parser.parse_args()
+
+    anim = visualize_motion_file(
+        args.motion_file,
+        show_html=False,
+        add_root_y_to_joints=bool(args.add_root_y),
+    )
     plt.show()
 
 
