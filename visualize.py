@@ -35,7 +35,7 @@ def _qrot(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return (v + 2 * (q[:, :1] * uv + uuv)).view(original_shape)
 
 
-def recover_from_ric(data: np.ndarray, joints_num: int = 22, y_mode: str = "auto") -> np.ndarray:
+def recover_from_ric(data: np.ndarray, joints_num: int = 22, y_mode: str = "world") -> np.ndarray:
     """
     Recover 3D joint positions from root-relative representation.
     
@@ -70,7 +70,10 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22, y_mode: str = "auto
     # Normalize Y convention across different feature sources.
     # Some motions store non-root Y as root-relative, others as world Y,
     # and some accidentally contain root Y twice.
-    if y_mode == "root-relative":
+    if y_mode == "world":
+        # Non-root Y is already in world space.
+        pass
+    elif y_mode == "root-relative":
         positions[..., 1] += r_pos[..., 1:2]
     elif y_mode == "double-root":
         positions[..., 1] -= r_pos[..., 1:2]
@@ -193,7 +196,7 @@ def visualize_motion_file(
     show_html: bool = True,
     center: bool = True,
     bounds_percentile: float = 1.0,
-    y_mode: str = "auto",
+    y_mode: str = "world",
 ):
     """
     Load and visualize motion from file.
@@ -248,8 +251,8 @@ def main():
     parser.add_argument(
         "--y-mode",
         type=str,
-        choices=["auto", "root-relative", "double-root"],
-        default="auto",
+        choices=["world", "root-relative", "double-root", "auto"],
+        default="world",
         help="Convention for non-root Y in feature decode",
     )
     args = parser.parse_args()
