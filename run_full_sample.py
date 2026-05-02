@@ -94,9 +94,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-keyframe-ends", action="store_true", help="Do not force first/last frame in random keyframe strategy")
     parser.add_argument("--stride", type=int, default=1, help="Visualization frame stride")
     parser.add_argument("--interval-ms", type=int, default=80, help="Animation interval in ms")
-    parser.add_argument("--ar-clamp-sigma", type=float, default=3.5,
-                        help="Clamp T2M-GPT VQ output to ±N sigma (default 3.5). "
-                             "Prevents OOD tokens from producing physically impossible velocities.")
+    parser.add_argument("--ar-clamp-sigma", type=float, default=0.0,
+                        help="Clamp T2M-GPT VQ output to ±N sigma. Set <=0 to disable (default: disabled).")
     return parser.parse_args()
 
 
@@ -171,10 +170,9 @@ def main() -> None:
             "using native length to avoid corrupting HumanML3D features with linear resampling."
         )
 
-    # Clamp extreme feature values that arise from out-of-distribution VQ tokens.
-    # ±3.5σ keeps all physically plausible motions; beyond that the decoder is
-    # generating token combinations it never saw during T2M-GPT training.
-    ar_motion_norm = torch.clamp(ar_motion_norm, -args.ar_clamp_sigma, args.ar_clamp_sigma)
+    if args.ar_clamp_sigma > 0:
+        # Optional safety clamp for extreme out-of-distribution token decodes.
+        ar_motion_norm = torch.clamp(ar_motion_norm, -args.ar_clamp_sigma, args.ar_clamp_sigma)
 
     cond = encode_text(clip_model, [args.prompt])
     cond_uncond = encode_text(clip_model, [""])
@@ -253,10 +251,6 @@ def main() -> None:
         guidance_scale=args.diff_guidance,
         cond_uncond=cond_uncond,
     )[0]
-
-    # Clamp diffusion output to prevent physically implausible joint reconstructions
-    # If std is extreme after denormalization, clamping keeps skeleton generation stable
-        # Removed clamping to let OOD values flow through
 
     ar_motion = ar_motion_norm.cpu() * (std + 1e-8) + mean
     motion = motion_norm.cpu() * (std + 1e-8) + mean
