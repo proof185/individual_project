@@ -110,7 +110,10 @@ def animate_skeleton(
         keyframe_indices = [i // stride for i in keyframe_indices if i // stride < T]
     
     if center:
-        motion = motion - motion[:, [0], :]
+        # Center only in the horizontal plane; keeping Y unchanged avoids
+        # introducing vertical artifacts when root-height conventions differ.
+        motion[..., 0] = motion[..., 0] - motion[:, [0], 0]
+        motion[..., 2] = motion[..., 2] - motion[:, [0], 2]
     
     # Compute plot bounds. Robust percentile bounds avoid tiny-looking skeletons
     # when a few outlier frames have implausible coordinates.
