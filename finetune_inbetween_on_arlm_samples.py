@@ -174,7 +174,17 @@ def _build_xyz_to_hml_converter(humanml_root: str, preprocess_lib: dict):
         quat_params = qfix(quat_params)
         cont_6d_params = quaternion_to_cont6d_np(quat_params)
 
-        r_rot = quat_params[:, 0].copy()
+        root_quat = quat_params[:, 0].copy()
+        # Keep only yaw in root rotation so encoded features match HumanML3D
+        # reconstruction, which decodes root orientation as yaw-only.
+        yaw = np.arctan2(
+            2.0 * (root_quat[:, 0] * root_quat[:, 2] + root_quat[:, 1] * root_quat[:, 3]),
+            1.0 - 2.0 * (root_quat[:, 2] ** 2 + root_quat[:, 3] ** 2),
+        )
+        half_yaw = 0.5 * yaw
+        r_rot = np.zeros_like(root_quat)
+        r_rot[:, 0] = np.cos(half_yaw)
+        r_rot[:, 2] = np.sin(half_yaw)
         velocity = (positions[1:, 0] - positions[:-1, 0]).copy()
         velocity = qrot_np(r_rot[1:], velocity)
         r_velocity_quat = qmul_np(r_rot[1:], qinv_np(r_rot[:-1]))
