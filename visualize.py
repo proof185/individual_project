@@ -35,7 +35,7 @@ def _qrot(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return (v + 2 * (q[:, :1] * uv + uuv)).view(original_shape)
 
 
-def recover_from_ric(data: np.ndarray, joints_num: int = 22, y_mode: str = "world") -> np.ndarray:
+def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     """
     Recover 3D joint positions from root-relative representation.
     
@@ -70,22 +70,11 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22, y_mode: str = "worl
     # Normalize Y convention across different feature sources.
     # Some motions store non-root Y as root-relative, others as world Y,
     # and some accidentally contain root Y twice.
-    if y_mode == "world":
-        # Non-root Y is already in world space.
-        pass
-    elif y_mode == "root-relative":
-        positions[..., 1] += r_pos[..., 1:2]
-    elif y_mode == "double-root":
-        positions[..., 1] -= r_pos[..., 1:2]
-    else:
-        y_delta = positions[..., 1] - r_pos[..., 1:2]
-        median_delta = torch.median(y_delta)
-        if median_delta < -0.2:
-            # Non-root Y appears root-relative; convert to world Y.
-            positions[..., 1] += r_pos[..., 1:2]
-        elif median_delta > 0.2:
-            # Non-root Y appears to include root Y twice; remove one root term.
-            positions[..., 1] -= r_pos[..., 1:2]
+    # Force root-relative Y decode.
+    positions[..., 1] += r_pos[..., 1:2]
+    # Hardcoded display adjustment requested by user: shift non-root joints
+    # down by 1.0 in Y while keeping root unchanged.
+    positions[..., 1] -= 1.0
 
     positions[..., 0] += r_pos[..., 0:1]
     positions[..., 2] += r_pos[..., 2:3]
@@ -196,7 +185,6 @@ def visualize_motion_file(
     show_html: bool = True,
     center: bool = True,
     bounds_percentile: float = 1.0,
-    y_mode: str = "world",
 ):
     """
     Load and visualize motion from file.
@@ -224,7 +212,7 @@ def visualize_motion_file(
         print(f"Loaded joint-positions motion: {joints.shape}")
     else:
         # HumanML3D 263-dim feature vectors (T, F)
-        joints = recover_from_ric(vecs, joints_num=22, y_mode=y_mode)
+        joints = recover_from_ric(vecs, joints_num=22)
         print(f"Loaded motion (recovered from features): {joints.shape}")
     
     anim = animate_skeleton(
@@ -248,19 +236,11 @@ def main():
 
     parser = argparse.ArgumentParser(description="Visualize motion .npy files")
     parser.add_argument("motion_file", type=str, help="Path to motion .npy file")
-    parser.add_argument(
-        "--y-mode",
-        type=str,
-        choices=["world", "root-relative", "double-root", "auto"],
-        default="world",
-        help="Convention for non-root Y in feature decode",
-    )
     args = parser.parse_args()
 
     anim = visualize_motion_file(
         args.motion_file,
         show_html=False,
-        y_mode=args.y_mode,
     )
     plt.show()
 
