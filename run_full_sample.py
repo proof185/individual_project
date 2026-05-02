@@ -70,6 +70,33 @@ def _default_inbetween_ckpt() -> tuple[str, int | None]:
     return os.path.join("checkpoints", f"composite_inbetween_step{step}.pt"), step
 
 
+def _load_t2mgpt_stats(t2mgpt_root: str, feature_dim: int) -> tuple[torch.Tensor | None, torch.Tensor | None, str | None]:
+    candidates = [
+        os.path.join(t2mgpt_root, "dataset", "HumanML3D", "Mean.npy"),
+        os.path.join(t2mgpt_root, "HumanML3D", "Mean.npy"),
+    ]
+
+    mean_path = None
+    for path in candidates:
+        if os.path.exists(path):
+            mean_path = path
+            break
+
+    if mean_path is None:
+        return None, None, None
+
+    std_path = mean_path.replace("Mean.npy", "Std.npy")
+    if not os.path.exists(std_path):
+        return None, None, None
+
+    mean = torch.from_numpy(np.load(mean_path)).float().view(-1)
+    std = torch.from_numpy(np.load(std_path)).float().view(-1)
+    if int(mean.numel()) != feature_dim or int(std.numel()) != feature_dim:
+        return None, None, None
+
+    return mean, std, os.path.dirname(mean_path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and visualize one full sample (T2M-GPT + diffusion)")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt to generate")
@@ -174,6 +201,21 @@ def main() -> None:
         # Optional safety clamp for extreme out-of-distribution token decodes.
         ar_motion_norm = torch.clamp(ar_motion_norm, -args.ar_clamp_sigma, args.ar_clamp_sigma)
 
+    # Remap ARLM normalized features into the local diffusion normalization space.
+    local_mean = mean.to(ar_motion_norm.device).view(1, -1)
+    local_std = std.to(ar_motion_norm.device).view(1, -1)
+    t2m_mean, t2m_std, t2m_stats_source = _load_t2mgpt_stats(t2mgpt_root, fdim)
+    if t2m_mean is not None and t2m_std is not None:
+        t2m_mean = t2m_mean.to(ar_motion_norm.device).view(1, -1)
+        t2m_std = t2m_std.to(ar_motion_norm.device).view(1, -1)
+        ar_motion_raw = ar_motion_norm * (t2m_std + 1e-8) + t2m_mean
+        ar_motion_norm = (ar_motion_raw - local_mean) / (local_std + 1e-8)
+        print(f"AR stats remap: using T2M-GPT stats from {t2m_stats_source}")
+    else:
+        t2m_stats_source = None
+        ar_motion_raw = ar_motion_norm * (local_std + 1e-8) + local_mean
+        print("AR stats remap: T2M-GPT Mean/Std not found, falling back to local stats")
+
     cond = encode_text(clip_model, [args.prompt])
     cond_uncond = encode_text(clip_model, [""])
 
@@ -252,9 +294,11 @@ def main() -> None:
         cond_uncond=cond_uncond,
     )[0]
 
-    ar_motion = ar_motion_norm.cpu() * (std + 1e-8) + mean
-    motion = motion_norm.cpu() * (std + 1e-8) + mean
-    keyframes = keyframes_norm.cpu() * (std + 1e-8) + mean
+    mean_cpu = mean.detach().cpu().view(-1)
+    std_cpu = std.detach().cpu().view(-1)
+    ar_motion = ar_motion_raw.cpu()
+    motion = motion_norm.cpu() * (std_cpu + 1e-8) + mean_cpu
+    keyframes = keyframes_norm.cpu() * (std_cpu + 1e-8) + mean_cpu
     keyframe_idx = keyframe_indices.cpu()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -283,6 +327,7 @@ def main() -> None:
         "inbetween_steps": int(inbetween_steps),
         "inbetween_ckpt": os.path.abspath(inbetween_ckpt_path),
         "t2mgpt_root": t2mgpt_root,
+        "t2mgpt_stats_source": t2m_stats_source,
         "t2mgpt_vq_ckpt": os.path.abspath(arlm_vq_ckpt),
         "t2mgpt_gpt_ckpt": os.path.abspath(arlm_gpt_ckpt),
         "device": str(device),

@@ -68,8 +68,6 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     positions = _qrot(_qinv(r_rot_quat[..., None, :]).expand(positions.shape[:-1] + (4,)), positions)
     positions[..., 0] += r_pos[..., 0:1]
     positions[..., 2] += r_pos[..., 2:3]
-    # Use one consistent convention: decode non-root joints in world Y.
-    positions[..., 1] += r_pos[..., 1:2]
     joints = torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
     return joints.cpu().numpy()
 
@@ -110,11 +108,8 @@ def animate_skeleton(
         keyframe_indices = [i // stride for i in keyframe_indices if i // stride < T]
     
     if center:
-        # Keep horizontal root centered each frame.
-        motion[..., 0] = motion[..., 0] - motion[:, [0], 0]
-        motion[..., 2] = motion[..., 2] - motion[:, [0], 2]
-        # Anchor vertical baseline once to avoid per-frame root-Y wobble.
-        motion[..., 1] = motion[..., 1] - motion[0, 0, 1]
+        # Keep the root fixed at the origin in all axes for stable visualization.
+        motion = motion - motion[:, [0], :]
     
     # Compute plot bounds. Robust percentile bounds avoid tiny-looking skeletons
     # when a few outlier frames have implausible coordinates.
