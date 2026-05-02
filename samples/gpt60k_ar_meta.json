@@ -1,0 +1,10 @@
+{
+  "mode": "ar",
+  "prompt": "a person walks forward",
+  "length": 76,
+  "device": "cuda",
+  "gpt_steps": 60000,
+  "inbetween_steps": 200000,
+  "gpt_ckpt": "checkpoints/composite_gpt_step60000.pt",
+  "inbetween_ckpt": null
+}

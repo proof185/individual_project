@@ -1,0 +1,28 @@
+humanml_new_joint_vecs
+  dir=D:\Projects\individual_project\humanml\new_joint_vecs
+  files=17126 load_failures=0
+  shapes=[((199, 263), 2468), ((100, 263), 206), ((80, 263), 202), ((110, 263), 194), ((70, 263), 194), ((90, 263), 184), ((98, 263), 160), ((119, 263), 152)]
+  feature_dims={263: 17126}
+  length_range=(7, 469)
+
+finetune_dataset_direct
+  dir=D:\Projects\individual_project\humanml\arlm_new_joint_vecs
+  files=13696 load_failures=0
+  shapes=[((196, 263), 2160), ((100, 263), 172), ((80, 263), 168), ((110, 263), 156), ((90, 263), 154), ((70, 263), 148), ((98, 263), 144), ((119, 263), 128)]
+  feature_dims={263: 13696}
+  length_range=(8, 196)
+
+finetune_dataset_converted
+  dir=D:\Projects\individual_project\humanml\arlm_train_pred_joint_vecs
+  files=13984 load_failures=0
+  shapes=[((195, 263), 1735), ((99, 263), 580), ((191, 263), 577), ((79, 263), 540), ((95, 263), 474), ((87, 263), 470), ((75, 263), 448), ((59, 263), 430)]
+  feature_dims={263: 13984}
+  length_range=(3, 195)
+
+samples_motion_files
+  dir=D:\Projects\individual_project\samples
+  files=13 load_failures=0
+  shapes=[((100, 263), 4), ((120, 263), 2), ((80, 263), 2), ((156, 263), 1), ((196, 263), 1), ((192, 263), 1), ((136, 263), 1), ((76, 263), 1)]
+  feature_dims={263: 13}
+  length_range=(76, 196)
+

@@ -351,6 +351,9 @@ class KeyframeSelector(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         self.out = nn.Linear(d_model, 1)
+        # Initialise output bias so sigmoid(bias) ≈ target_ratio (10%).
+        # sigmoid(-2.2) ≈ 0.10, preventing early all-ones collapse.
+        nn.init.constant_(self.out.bias, -2.2)
         nn.init.normal_(self.pos_emb, std=0.02)
 
     def forward(

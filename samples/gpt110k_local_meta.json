@@ -1,0 +1,8 @@
+{
+  "prompt": "a person walks forward, turns, and waves",
+  "length": 120,
+  "gpt_ckpt": "checkpoints\\composite_gpt_step110000.pt",
+  "inbetween_ckpt": "checkpoints\\composite_inbetween_best.pt",
+  "device": "cuda",
+  "num_keyframes": 2
+}

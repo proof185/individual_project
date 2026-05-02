@@ -9,13 +9,38 @@ class CompositeConfig:
     split: str = 'train'
     max_len: int = 196
     batch_size: int = 32
-    num_workers: int = 4
+    num_workers: int = 0
+    pin_memory: bool = True
+    persistent_workers: bool = False
+    prefetch_factor: int = 2
+    keyframe_source_dir: str | None = None
 
     lr: float = 1e-4
-    vqvae_steps: int = 50_000    # Stage 1a: VQ-VAE training
-    gpt_steps: int = 100_000     # Stage 1b: GPT training
-    inbetween_steps: int = 100_000  # Stage 2: Diffusion in-betweening
+    vqvae_steps: int = 100_000   # Stage 1a: VQ-VAE training (more steps for larger model)
+    gpt_steps: int = 200_000     # Stage 1b: GPT training (more steps for larger model)
+    inbetween_steps: int = 200_000  # Stage 2: Diffusion in-betweening
     grad_clip: float = 1.0
+    grad_accum_steps: int = 4
+
+    # Optimizer/LR schedule
+    scheduler_type: str = 'cosine'  # 'cosine' or 'constant'
+    warmup_ratio: float = 0.02
+    min_lr_ratio: float = 0.05
+
+    # In-between optimizer split LRs
+    inbetween_lr: float | None = None
+    selector_lr: float | None = None
+    selector_lr_scale: float = 0.5
+
+    # EMA for in-between model/selector
+    ema_decay: float = 0.999
+    use_ema_for_sampling: bool = True
+
+    # In-between validation / checkpoint selection
+    val_split: str = 'val'
+    val_batch_size: int = 32
+    val_interval: int = 1000
+    val_batches: int = 10
 
     # In-betweening config
     keyframe_interval: int = 5   # Generate keyframe every n frames
@@ -40,13 +65,14 @@ class CompositeConfig:
     selector_heads: int = 4
     selector_dropout: float = 0.1
     selector_threshold: float = 0.5
-    selector_target_ratio: float = 0.12
-    selector_budget_weight: float = 2.0
+    selector_target_ratio: float = 0.1
+    selector_budget_weight: float = 5.0
     selector_entropy_weight: float = 0.02
+    selector_curriculum_fraction: float = 0.0
 
     # VQ-VAE
-    codebook_size: int = 512
-    codebook_dim: int = 512
+    codebook_size: int = 512   # Larger codebook for richer motion vocabulary
+    codebook_dim: int = 256
     commitment_cost: float = 0.25
     downsample_rate: int = 4
 
@@ -55,10 +81,15 @@ class CompositeConfig:
 
     # Classifier-free guidance
     p_uncond: float = 0.1
-    guidance_scale: float = 2.5
+    guidance_scale: float = 5.0
 
-    # Model dimensions
-    d_model: int = 256
-    n_layers: int = 6
+    # Model dimensions (GPT)
+    d_model: int = 512          # Larger GPT for better token sequence modelling
+    n_layers: int = 12          # Deeper GPT
     n_heads: int = 8
     dropout: float = 0.1
+
+    # In-betweening model dimensions
+    inbetween_d_model: int = 512
+    inbetween_layers: int = 12
+    inbetween_heads: int = 8

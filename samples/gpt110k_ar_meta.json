@@ -1,0 +1,10 @@
+{
+  "mode": "ar",
+  "prompt": "a person walks forward, turns, and waves",
+  "length": 196,
+  "device": "cuda",
+  "gpt_steps": 200000,
+  "inbetween_steps": 200000,
+  "gpt_ckpt": "checkpoints/composite_gpt_step110000.pt",
+  "inbetween_ckpt": null
+}

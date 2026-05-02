@@ -1,0 +1,10 @@
+{
+  "mode": "ar",
+  "prompt": "a person does a flip",
+  "length": 156,
+  "device": "cuda",
+  "gpt_steps": 100000,
+  "inbetween_steps": 200000,
+  "gpt_ckpt": "checkpoints/composite_gpt_step100000.pt",
+  "inbetween_ckpt": null
+}

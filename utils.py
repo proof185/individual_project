@@ -7,6 +7,35 @@ import torch.nn.functional as F
 import clip
 
 
+def encode_text_with_tokens(clip_model, texts: List[str], normalize: bool = True):
+    """Encode text into pooled CLIP embeddings and per-token features."""
+    device = next(clip_model.parameters()).device
+    tokens = clip.tokenize(texts, truncate=True).to(device)
+
+    x = clip_model.token_embedding(tokens).type(clip_model.dtype)
+    x = x + clip_model.positional_embedding.type(clip_model.dtype)
+    x = x.permute(1, 0, 2)
+    x = clip_model.transformer(x)
+    x = x.permute(1, 0, 2)
+    x = clip_model.ln_final(x).type(clip_model.dtype)
+
+    if hasattr(clip_model, 'text_projection') and clip_model.text_projection is not None:
+        token_features = x @ clip_model.text_projection
+    else:
+        token_features = x
+
+    pooled = token_features[torch.arange(token_features.shape[0], device=device), tokens.argmax(dim=-1)]
+    token_mask = tokens.ne(0)
+
+    token_features = token_features.float()
+    pooled = pooled.float()
+    if normalize:
+        pooled = F.normalize(pooled, dim=-1)
+        token_features = F.normalize(token_features, dim=-1)
+
+    return pooled, token_features, token_mask
+
+
 def masked_mse(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Compute MSE loss with masking."""
     m = mask.float().unsqueeze(-1)
@@ -57,17 +86,35 @@ def boundary_velocity_loss(
     keyframe_indices: torch.Tensor,
     keyframe_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Match velocity only on edges touching keyframes."""
+    """Match velocity only on edges touching keyframes (vectorized)."""
     B, T, _ = x.shape
-    edge_mask = torch.zeros(B, max(T - 1, 0), dtype=torch.bool, device=x.device)
+    edge_len = max(T - 1, 0)
+    if edge_len == 0:
+        return x.new_tensor(0.0)
 
-    for b in range(B):
-        valid_idx = keyframe_indices[b][keyframe_mask[b]]
-        for idx in valid_idx.tolist():
-            if idx > 0 and mask[b, idx - 1] and mask[b, idx]:
-                edge_mask[b, idx - 1] = True
-            if idx < T - 1 and mask[b, idx] and mask[b, idx + 1]:
-                edge_mask[b, idx] = True
+    idx = keyframe_indices.long()   # (B, K)
+    valid_k = keyframe_mask.bool()  # (B, K)
+    mask_long = mask.long()         # (B, T)
+
+    idx_clamp  = idx.clamp(0, T - 1)
+    left_idx   = (idx - 1).clamp(0, T - 1)
+    right_idx  = (idx + 1).clamp(0, T - 1)
+
+    at_kf    = torch.gather(mask_long, 1, idx_clamp).bool()  # (B, K)
+    at_left  = torch.gather(mask_long, 1, left_idx).bool()   # (B, K)
+    at_right = torch.gather(mask_long, 1, right_idx).bool()  # (B, K)
+
+    # Left edge (idx-1 → idx): edge position idx-1
+    left_valid = valid_k & (idx > 0) & at_kf & at_left
+    left_pos   = (idx - 1).clamp(0, edge_len - 1)
+    # Right edge (idx → idx+1): edge position idx
+    right_valid = valid_k & (idx < T - 1) & at_kf & at_right
+    right_pos   = idx.clamp(0, edge_len - 1)
+
+    edge_float = x.new_zeros(B, edge_len)
+    edge_float.scatter_add_(1, left_pos,  left_valid.float())
+    edge_float.scatter_add_(1, right_pos, right_valid.float())
+    edge_mask = edge_float > 0.0
 
     v_gt = x[:, 1:] - x[:, :-1]
     v_pr = x_hat[:, 1:] - x_hat[:, :-1]
@@ -81,15 +128,31 @@ def boundary_acceleration_loss(
     keyframe_indices: torch.Tensor,
     keyframe_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Match acceleration only in triplets centered on keyframes."""
+    """Match acceleration only in triplets centred on keyframes (vectorized)."""
     B, T, _ = x.shape
-    accel_mask = torch.zeros(B, max(T - 2, 0), dtype=torch.bool, device=x.device)
+    accel_len = max(T - 2, 0)
+    if accel_len == 0:
+        return x.new_tensor(0.0)
 
-    for b in range(B):
-        valid_idx = keyframe_indices[b][keyframe_mask[b]]
-        for idx in valid_idx.tolist():
-            if 0 < idx < T - 1 and mask[b, idx - 1] and mask[b, idx] and mask[b, idx + 1]:
-                accel_mask[b, idx - 1] = True
+    idx = keyframe_indices.long()   # (B, K)
+    valid_k = keyframe_mask.bool()  # (B, K)
+    mask_long = mask.long()         # (B, T)
+
+    idx_clamp  = idx.clamp(0, T - 1)
+    left_idx   = (idx - 1).clamp(0, T - 1)
+    right_idx  = (idx + 1).clamp(0, T - 1)
+
+    at_kf    = torch.gather(mask_long, 1, idx_clamp).bool()  # (B, K)
+    at_left  = torch.gather(mask_long, 1, left_idx).bool()   # (B, K)
+    at_right = torch.gather(mask_long, 1, right_idx).bool()  # (B, K)
+
+    # Triplet centred at idx: accel tensor index = idx - 1
+    triplet_valid = valid_k & (idx > 0) & (idx < T - 1) & at_kf & at_left & at_right
+    accel_pos = (idx - 1).clamp(0, accel_len - 1)
+
+    accel_float = x.new_zeros(B, accel_len)
+    accel_float.scatter_add_(1, accel_pos, triplet_valid.float())
+    accel_mask = accel_float > 0.0
 
     accel_gt = x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]
     accel_pr = x_hat[:, 2:] - 2 * x_hat[:, 1:-1] + x_hat[:, :-2]
@@ -180,12 +243,15 @@ def setup_clip_model(device: str = 'cuda'):
 @torch.no_grad()
 def encode_text(clip_model, texts: List[str], normalize: bool = True) -> torch.Tensor:
     """Encode text using CLIP."""
-    device = next(clip_model.parameters()).device
-    tokens = clip.tokenize(texts, truncate=True).to(device)
-    emb = clip_model.encode_text(tokens).float()
-    if normalize:
-        emb = F.normalize(emb, dim=-1)
+    emb, _, _ = encode_text_with_tokens(clip_model, texts, normalize=normalize)
     return emb
+
+
+@torch.no_grad()
+def encode_text_tokens(clip_model, texts: List[str], normalize: bool = True):
+    """Encode text into per-token CLIP features plus a valid-token mask."""
+    _, token_features, token_mask = encode_text_with_tokens(clip_model, texts, normalize=normalize)
+    return token_features, token_mask
 
 
 def prepare_gpt_batch(batch, vqvae, gpt, downsample_rate, device):

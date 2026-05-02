@@ -70,12 +70,12 @@ class EvalConfig:
     
     # Model architecture (must match training)
     d_model: int = 512
-    n_layers: int = 8
+    n_layers: int = 12
     n_heads: int = 8
     dropout: float = 0.1
     
     # VQ-VAE (for MotionGPT)
-    codebook_size: int = 512
+    codebook_size: int = 1024
     codebook_dim: int = 512
     downsample_rate: int = 4
     commitment_cost: float = 0.25

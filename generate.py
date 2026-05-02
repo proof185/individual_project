@@ -1,5 +1,7 @@
 """Inference functions for composite motion generation."""
 
+import argparse
+import json
 import os
 import random
 
@@ -10,10 +12,16 @@ from config import CompositeConfig
 from models.vqvae import MotionVQVAE
 from models.gpt import MotionGPT
 from models.diffusion import InbetweenDiffusion, InbetweenTransformer, KeyframeSelector
-from utils import setup_clip_model, encode_text
+from utils import setup_clip_model, encode_text, encode_text_with_tokens
 
 
-def load_models(cfg: CompositeConfig, device: str = 'cuda'):
+def load_models(
+    cfg: CompositeConfig,
+    device: str = 'cuda',
+    gpt_ckpt_path: str | None = None,
+    inbetween_ckpt_path: str | None = None,
+    load_inbetween: bool = True,
+):
     """Load trained models from checkpoints."""
     # Load normalization statistics
     mean_path = os.path.join(cfg.root, 'Mean.npy')
@@ -21,6 +29,71 @@ def load_models(cfg: CompositeConfig, device: str = 'cuda'):
     mean = torch.from_numpy(np.load(mean_path)).float().view(-1)
     std = torch.from_numpy(np.load(std_path)).float().view(-1)
     Fdim = mean.shape[0]
+
+    if gpt_ckpt_path is None:
+        gpt_ckpt_path = f'checkpoints/composite_gpt_step{cfg.gpt_steps}.pt'
+    if inbetween_ckpt_path is None:
+        inbetween_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
+
+    gpt_ckpt = None
+    gpt_state = None
+    inbetween_ckpt = None
+    inbetween_state = None
+
+    if os.path.exists(gpt_ckpt_path):
+        gpt_ckpt = torch.load(gpt_ckpt_path, map_location=device)
+        gpt_state = gpt_ckpt.get('gpt')
+
+    if load_inbetween and os.path.exists(inbetween_ckpt_path):
+        inbetween_ckpt = torch.load(inbetween_ckpt_path, map_location=device)
+        inbetween_state = inbetween_ckpt.get('inbetween')
+
+    def _count_prefix_layers(state_dict: dict, prefix: str, index_pos: int) -> int:
+        idx = set()
+        for k in state_dict.keys():
+            if not k.startswith(prefix):
+                continue
+            parts = k.split('.')
+            if len(parts) > index_pos and parts[index_pos].isdigit():
+                idx.add(int(parts[index_pos]))
+        return (max(idx) + 1) if idx else 0
+
+    # Start from config defaults, then override from checkpoint metadata/state when present.
+    gpt_d_model = cfg.d_model
+    gpt_n_layers = cfg.n_layers
+    gpt_n_heads = cfg.n_heads
+
+    inbetween_d_model = cfg.inbetween_d_model
+    inbetween_n_layers = cfg.inbetween_layers
+    inbetween_n_heads = cfg.inbetween_heads
+
+    if isinstance(inbetween_ckpt, dict):
+        saved_cfg = inbetween_ckpt.get('cfg')
+        if isinstance(saved_cfg, dict):
+            gpt_d_model = int(saved_cfg.get('d_model', gpt_d_model))
+            gpt_n_layers = int(saved_cfg.get('n_layers', gpt_n_layers))
+            gpt_n_heads = int(saved_cfg.get('n_heads', gpt_n_heads))
+
+            inbetween_d_model = int(saved_cfg.get('inbetween_d_model', saved_cfg.get('d_model', inbetween_d_model)))
+            inbetween_n_layers = int(saved_cfg.get('inbetween_layers', saved_cfg.get('n_layers', inbetween_n_layers)))
+            inbetween_n_heads = int(saved_cfg.get('inbetween_heads', saved_cfg.get('n_heads', inbetween_n_heads)))
+
+    if isinstance(gpt_state, dict):
+        if 'token_emb.weight' in gpt_state:
+            gpt_d_model = int(gpt_state['token_emb.weight'].shape[1])
+        counted = _count_prefix_layers(gpt_state, 'blocks.', 1)
+        if counted > 0:
+            gpt_n_layers = counted
+        # Detect cross-attention GPT vs old prepend-token GPT.
+        # Old style had no 'blocks.0.cross_attn.*' keys; new style does.
+        # (No architecture change needed here – MotionGPT accepts both n_layers values.)
+
+    if isinstance(inbetween_state, dict):
+        if 'frame_in.weight' in inbetween_state:
+            inbetween_d_model = int(inbetween_state['frame_in.weight'].shape[0])
+        counted = _count_prefix_layers(inbetween_state, 'encoder.layers.', 2)
+        if counted > 0:
+            inbetween_n_layers = counted
     
     # Initialize models
     vqvae = MotionVQVAE(
@@ -33,45 +106,52 @@ def load_models(cfg: CompositeConfig, device: str = 'cuda'):
     
     gpt = MotionGPT(
         codebook_size=cfg.codebook_size,
-        d_model=cfg.d_model,
-        n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads,
+        d_model=gpt_d_model,
+        n_layers=gpt_n_layers,
+        n_heads=gpt_n_heads,
         dropout=cfg.dropout,
         max_len=cfg.max_len // cfg.downsample_rate + 10,
         cond_dim=512,
     ).to(device)
     
-    inbetween_model = InbetweenTransformer(
-        feature_dim=Fdim,
-        cond_dim=512,
-        d_model=cfg.d_model,
-        n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads,
-        dropout=cfg.dropout,
-        max_len=cfg.max_len + 10,
-    ).to(device)
-    
-    diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
+    inbetween_model = None
+    diff_inbetween = None
+    if load_inbetween:
+        inbetween_model = InbetweenTransformer(
+            feature_dim=Fdim,
+            cond_dim=512,
+            d_model=inbetween_d_model,
+            n_layers=inbetween_n_layers,
+            n_heads=inbetween_n_heads,
+            dropout=cfg.dropout,
+            max_len=cfg.max_len + 10,
+        ).to(device)
+        diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
     
     # Load checkpoints
-    gpt_ckpt_path = f'checkpoints/composite_gpt_step{cfg.gpt_steps}.pt'
-    if os.path.exists(gpt_ckpt_path):
-        gpt_ckpt = torch.load(gpt_ckpt_path, map_location=device)
-        gpt.load_state_dict(gpt_ckpt['gpt'])
+    if gpt_ckpt is not None:
+        try:
+            gpt.load_state_dict(gpt_ckpt['gpt'])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                'GPT checkpoint is incompatible with the new token-level text conditioning. '
+                'Retrain GPT before generating samples with this code.'
+            ) from exc
         vqvae.load_state_dict(gpt_ckpt['vqvae'])
         print(f"Loaded GPT and VQ-VAE from {gpt_ckpt_path}")
     
-    inbetween_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
-    if os.path.exists(inbetween_ckpt_path):
-        inbetween_ckpt = torch.load(inbetween_ckpt_path, map_location=device)
-        inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
-        selector_state = inbetween_ckpt.get('selector')
+    if load_inbetween and inbetween_ckpt is not None:
+        inbetween_state_for_infer = inbetween_ckpt.get('inbetween_ema', inbetween_ckpt['inbetween'])
+        inbetween_model.load_state_dict(inbetween_state_for_infer)
+        selector_state = inbetween_ckpt.get('selector_ema', inbetween_ckpt.get('selector'))
         if cfg.use_learned_keyframe_selector and selector_state is not None:
+            selector_d_model = int(selector_state['frame_in.weight'].shape[0])
+            selector_layers = _count_prefix_layers(selector_state, 'encoder.layers.', 2) or cfg.selector_layers
             selector_model = KeyframeSelector(
                 feature_dim=Fdim,
                 cond_dim=512,
-                d_model=cfg.d_model,
-                n_layers=cfg.selector_layers,
+                d_model=selector_d_model,
+                n_layers=selector_layers,
                 n_heads=cfg.selector_heads,
                 dropout=cfg.selector_dropout,
                 max_len=cfg.max_len + 10,
@@ -80,13 +160,14 @@ def load_models(cfg: CompositeConfig, device: str = 'cuda'):
             selector_model.load_state_dict(selector_state)
             selector_model.eval()
             inbetween_model.keyframe_selector = selector_model
-            print('Loaded learned keyframe selector from in-betweening checkpoint')
-        print(f"Loaded in-betweening model from {inbetween_ckpt_path}")
+            print('Loaded learned keyframe selector from in-betweening checkpoint (EMA if available)')
+        print(f"Loaded in-betweening model from {inbetween_ckpt_path} (EMA if available)")
     
     # Set to eval mode
     vqvae.eval()
     gpt.eval()
-    inbetween_model.eval()
+    if inbetween_model is not None:
+        inbetween_model.eval()
     
     # Setup CLIP
     clip_model = setup_clip_model(device)
@@ -158,7 +239,7 @@ def generate_composite(
     ar_temperature: float = 0.9,
     ar_top_k: int = 50,
     ar_top_p: float = 0.95,
-    ar_guidance_scale: float = 2.5,
+    ar_guidance_scale: float | None = None,
     # Diffusion params
     diff_guidance_scale: float = 2.5,
     use_learned_selector: bool | None = None,
@@ -189,6 +270,7 @@ def generate_composite(
     k_min = keyframe_min if keyframe_min is not None else cfg.keyframe_min
     k_max = keyframe_max if keyframe_max is not None else cfg.keyframe_max
     include_ends = keyframe_include_ends if keyframe_include_ends is not None else cfg.keyframe_include_ends
+    ar_guidance = cfg.guidance_scale if ar_guidance_scale is None else ar_guidance_scale
 
     if strategy == 'random':
         print(f"Target length: {length} frames, random keyframes")
@@ -199,8 +281,8 @@ def generate_composite(
     print("\nStage 1: Generating keyframes with MotionGPT...")
     
     # Encode text
-    cond = encode_text(clip_model, [prompt])
-    cond_uncond = encode_text(clip_model, [''])
+    pooled_cond, cond, cond_mask = encode_text_with_tokens(clip_model, [prompt])
+    pooled_uncond, cond_uncond, cond_uncond_mask = encode_text_with_tokens(clip_model, [''])
     
     # Calculate how many tokens we need from VQ-VAE
     target_tokens = (length + cfg.downsample_rate - 1) // cfg.downsample_rate
@@ -212,8 +294,10 @@ def generate_composite(
         temperature=ar_temperature,
         top_k=ar_top_k,
         top_p=ar_top_p,
-        guidance_scale=ar_guidance_scale,
+        guidance_scale=ar_guidance,
         cond_uncond=cond_uncond,
+        cond_mask=cond_mask,
+        cond_uncond_mask=cond_uncond_mask,
     )  # (1, T')
     
     # Decode tokens to continuous motion
@@ -238,7 +322,7 @@ def generate_composite(
         _, selector_mask_st = selector_model(
             ar_motion_norm.unsqueeze(0),
             selector_valid,
-            cond=cond,
+            cond=pooled_cond,
         )
         keyframe_indices = torch.nonzero(selector_mask_st[0] > 0.5, as_tuple=False).squeeze(1)
         if keyframe_indices.numel() == 0:
@@ -275,16 +359,19 @@ def generate_composite(
     motion_norm = diff_inbetween.sample_inbetween(
         model=inbetween_model,
         shape=(B, T, F),
-        cond=cond,
+        cond=pooled_cond,
         mask=mask,
         keyframes=keyframes_batch,
         keyframe_indices=keyframe_indices_batch,
         keyframe_mask=keyframe_mask_batch,
         guidance_scale=diff_guidance_scale,
-        cond_uncond=cond_uncond,
+        cond_uncond=pooled_uncond,
     )  # (1, T, F)
     
     motion_norm = motion_norm[0]  # (T, F)
+
+    # Clamp diffusion output to prevent physically implausible joint reconstructions
+    # OOD features produce impossible skeleton positions when recovered via recover_from_ric()
     
     # Unnormalize
     motion = motion_norm.cpu() * (std + 1e-8) + mean
@@ -305,23 +392,29 @@ def generate_ar_only(
     cfg,
     prompt: str,
     length: int = 100,
-    guidance_scale: float = 2.5,
+    guidance_scale: float | None = None,
+    temperature: float = 0.9,
+    top_k: int = 50,
+    top_p: float = 0.95,
     device: str = 'cuda',
 ):
     """Generate using only the AR model (no diffusion refinement)."""
-    cond = encode_text(clip_model, [prompt])
-    cond_uncond = encode_text(clip_model, [''])
+    _, cond, cond_mask = encode_text_with_tokens(clip_model, [prompt])
+    _, cond_uncond, cond_uncond_mask = encode_text_with_tokens(clip_model, [''])
+    guidance = cfg.guidance_scale if guidance_scale is None else guidance_scale
     
     target_tokens = (length + cfg.downsample_rate - 1) // cfg.downsample_rate
     
     tokens = gpt.generate(
         cond=cond,
         max_new_tokens=target_tokens,
-        temperature=0.9,
-        top_k=50,
-        top_p=0.95,
-        guidance_scale=guidance_scale,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        guidance_scale=guidance,
         cond_uncond=cond_uncond,
+        cond_mask=cond_mask,
+        cond_uncond_mask=cond_uncond_mask,
     )
     
     motion_norm = vqvae.decode_indices(tokens)
@@ -332,44 +425,135 @@ def generate_ar_only(
 
 
 def main():
-    """Example usage."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    parser = argparse.ArgumentParser(description='Generate motion using AR-only or full (AR + diffusion) pipeline')
+    parser.add_argument('--mode', choices=['ar', 'full'], default='full', help='Generation mode')
+    parser.add_argument('--prompt', type=str, required=True, help='Text prompt')
+    parser.add_argument('--length', type=int, default=196, help='Target motion length in frames')
+    parser.add_argument('--device', type=str, default=None, help='Device, e.g. cuda or cpu')
+    parser.add_argument('--out-dir', type=str, default='samples', help='Output directory')
+    parser.add_argument('--out-name', type=str, default='sample', help='Output name prefix')
+
+    # Checkpoint/config controls
+    parser.add_argument('--gpt-steps', type=int, default=None, help='GPT step used to build default checkpoint path')
+    parser.add_argument('--inbetween-steps', type=int, default=None, help='In-between step used to build default checkpoint path')
+    parser.add_argument('--gpt-ckpt', type=str, default=None, help='Explicit GPT checkpoint path')
+    parser.add_argument('--inbetween-ckpt', type=str, default=None, help='Explicit in-between checkpoint path (full mode only)')
+
+    # AR decoding controls
+    parser.add_argument('--ar-guidance', type=float, default=None, help='CFG scale for AR generation (defaults to config guidance_scale)')
+    parser.add_argument('--ar-temperature', type=float, default=0.9, help='Sampling temperature for AR generation')
+    parser.add_argument('--ar-top-k', type=int, default=50, help='Top-k sampling cutoff for AR generation')
+    parser.add_argument('--ar-top-p', type=float, default=0.95, help='Top-p sampling cutoff for AR generation')
+
+    # Full mode keyframe/diffusion controls
+    parser.add_argument('--keyframe-strategy', type=str, choices=['interval', 'random'], default=None)
+    parser.add_argument('--keyframe-interval', type=int, default=5)
+    parser.add_argument('--keyframe-count', type=int, default=None)
+    parser.add_argument('--keyframe-min', type=int, default=None)
+    parser.add_argument('--keyframe-max', type=int, default=None)
+    parser.add_argument('--no-keyframe-ends', action='store_true')
+    parser.add_argument('--diff-guidance', type=float, default=2.5, help='CFG scale for diffusion in-betweening')
+    parser.add_argument('--disable-selector', action='store_true', help='Disable learned keyframe selector in full mode')
+
+    args = parser.parse_args()
+
+    device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
     cfg = CompositeConfig(
         keyframe_strategy='random',
         keyframe_max=20,
         keyframe_min=3,
     )
-    
-    # Load models
-    vqvae, gpt, inbetween_model, diff_inbetween, clip_model, mean, std, Fdim = load_models(cfg, device)
-    
-    print("Models loaded for inference")
-    
-    # Generate sample motion
-    prompt = "a person walks forward and then jumps"
-    
-    motion, keyframes, keyframe_idx = generate_composite(
-        vqvae, gpt, inbetween_model, diff_inbetween, clip_model,
-        mean, std, Fdim, cfg,
-        prompt,
-        length=120,
-        keyframe_interval=cfg.keyframe_interval,
-        keyframe_strategy=cfg.keyframe_strategy,
-        keyframe_min=cfg.keyframe_min,
-        keyframe_max=cfg.keyframe_max,
+    if args.gpt_steps is not None:
+        cfg.gpt_steps = int(args.gpt_steps)
+    if args.inbetween_steps is not None:
+        cfg.inbetween_steps = int(args.inbetween_steps)
+
+    use_full = args.mode == 'full'
+    gpt_ckpt_path = args.gpt_ckpt
+    inbetween_ckpt_path = args.inbetween_ckpt
+
+    vqvae, gpt, inbetween_model, diff_inbetween, clip_model, mean, std, Fdim = load_models(
+        cfg,
         device=device,
+        gpt_ckpt_path=gpt_ckpt_path,
+        inbetween_ckpt_path=inbetween_ckpt_path,
+        load_inbetween=use_full,
     )
-    
-    print(f"\nFinal motion shape: {motion.shape}")
-    print(f"Keyframes shape: {keyframes.shape}")
-    print(f"Keyframe indices: {keyframe_idx.tolist()}")
-    
-    # Save
-    np.save("sample_composite_output.npy", motion.numpy())
-    np.save("sample_composite_keyframes.npy", keyframes.numpy())
-    
-    print("\nSaved outputs to sample_composite_output.npy and sample_composite_keyframes.npy")
+
+    print(f'Models loaded for inference (mode={args.mode}, device={device})')
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    motion_path = os.path.join(args.out_dir, f'{args.out_name}_motion.npy')
+    meta_path = os.path.join(args.out_dir, f'{args.out_name}_meta.json')
+
+    if use_full:
+        motion, keyframes, keyframe_idx = generate_composite(
+            vqvae,
+            gpt,
+            inbetween_model,
+            diff_inbetween,
+            clip_model,
+            mean,
+            std,
+            Fdim,
+            cfg,
+            prompt=args.prompt,
+            length=args.length,
+            keyframe_interval=args.keyframe_interval,
+            keyframe_strategy=args.keyframe_strategy,
+            keyframe_count=args.keyframe_count,
+            keyframe_min=args.keyframe_min,
+            keyframe_max=args.keyframe_max,
+            keyframe_include_ends=(not args.no_keyframe_ends),
+            ar_temperature=args.ar_temperature,
+            ar_top_k=args.ar_top_k,
+            ar_top_p=args.ar_top_p,
+            ar_guidance_scale=args.ar_guidance,
+            diff_guidance_scale=args.diff_guidance,
+            use_learned_selector=(not args.disable_selector),
+            device=device,
+        )
+        keyframes_path = os.path.join(args.out_dir, f'{args.out_name}_keyframes.npy')
+        key_idx_path = os.path.join(args.out_dir, f'{args.out_name}_keyframe_indices.npy')
+        np.save(keyframes_path, keyframes.numpy())
+        np.save(key_idx_path, keyframe_idx.numpy())
+        print(f'Saved full-mode keyframes: {keyframes_path}')
+        print(f'Saved full-mode keyframe indices: {key_idx_path}')
+    else:
+        motion = generate_ar_only(
+            vqvae,
+            gpt,
+            clip_model,
+            mean,
+            std,
+            cfg,
+            prompt=args.prompt,
+            length=args.length,
+            guidance_scale=args.ar_guidance,
+            temperature=args.ar_temperature,
+            top_k=args.ar_top_k,
+            top_p=args.ar_top_p,
+            device=device,
+        )
+
+    np.save(motion_path, motion.numpy())
+    print(f'Saved motion: {motion_path}')
+    print(f'Final motion shape: {tuple(motion.shape)}')
+
+    meta = {
+        'mode': args.mode,
+        'prompt': args.prompt,
+        'length': int(motion.shape[0]),
+        'device': device,
+        'gpt_steps': int(cfg.gpt_steps),
+        'inbetween_steps': int(cfg.inbetween_steps),
+        'gpt_ckpt': gpt_ckpt_path,
+        'inbetween_ckpt': inbetween_ckpt_path if use_full else None,
+    }
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2)
+    print(f'Saved metadata: {meta_path}')
 
 
 if __name__ == '__main__':

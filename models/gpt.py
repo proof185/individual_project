@@ -1,4 +1,11 @@
-"""GPT models for autoregressive motion generation."""
+"""GPT models for autoregressive motion generation.
+
+Conditioning design:
+  Text embeddings are injected at *every* transformer block via a cross-attention
+  sub-layer (self-attention → cross-attention → FFN), rather than being prepended
+  as a single token.  This gives the model a persistent text signal throughout
+  the sequence and avoids positional-encoding entanglement with the condition.
+"""
 
 import math
 from typing import Optional
@@ -44,11 +51,47 @@ class CausalSelfAttention(nn.Module):
         return self.proj(out)
 
 
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention for injecting text conditioning context."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.q = nn.Linear(d_model, d_model)
+        self.kv = nn.Linear(d_model, 2 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, context_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, D = x.shape
+        S = context.shape[1]
+
+        q = self.q(x).reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(context).reshape(B, S, 2, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if context_mask is not None:
+            attn = attn.masked_fill(~context_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        return self.proj(out)
+
+
 class GPTBlock(nn.Module):
+    """Transformer block: causal self-attention → cross-attention (text) → FFN."""
+
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+        self.ln_ca = nn.LayerNorm(d_model)
+        self.cross_attn = CrossAttention(d_model, n_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -57,18 +100,33 @@ class GPTBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = x + self.attn(self.ln1(x), mask)
+        x = x + self.cross_attn(self.ln_ca(x), context, context_mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
 
 class MotionGPT(nn.Module):
+    """Autoregressive GPT for motion-token generation conditioned on text.
+
+    Text conditioning is supplied as a (B, cond_dim) CLIP embedding which is
+    projected to (B, 1, d_model) and injected via cross-attention at every
+    transformer layer.  This replaces the older single-prepended-token design,
+    giving the model a persistent text signal at every depth.
+    """
+
     def __init__(
         self,
         codebook_size: int,
         d_model: int = 512,
-        n_layers: int = 8,
+        n_layers: int = 12,
         n_heads: int = 8,
         dropout: float = 0.1,
         max_len: int = 256,
@@ -87,11 +145,16 @@ class MotionGPT(nn.Module):
         self.token_emb = nn.Embedding(self.vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, max_len, d_model))
 
+        # Project CLIP embedding → single cross-attention context token (B, 1, d_model)
+        self.cond_tokens = 4
+
+        # Project CLIP embedding → multiple context tokens (B, cond_tokens, d_model)
         self.cond_proj = nn.Sequential(
-            nn.Linear(cond_dim, d_model),
+            nn.Linear(cond_dim, d_model * self.cond_tokens),
             nn.SiLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * self.cond_tokens, d_model * self.cond_tokens),
         )
+        self.cond_seq_proj = nn.Linear(cond_dim, d_model)
 
         self.blocks = nn.ModuleList([
             GPTBlock(d_model, n_heads, dropout) for _ in range(n_layers)
@@ -99,34 +162,47 @@ class MotionGPT(nn.Module):
 
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, self.vocab_size, bias=False)
-        self.token_emb.weight = self.head.weight
+        self.token_emb.weight = self.head.weight  # Weight tying
 
         nn.init.normal_(self.pos_emb, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, cond: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        cond: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        cond_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            tokens: (B, T) long tensor
+            cond:   (B, cond_dim) text CLIP embedding
+            mask:   (B, T) bool mask (True = valid position)
+        Returns:
+            logits: (B, T, vocab_size)
+        """
         B, T = tokens.shape
 
         tok_emb = self.token_emb(tokens)
         pos_emb = self.pos_emb[:, :T, :]
         h = tok_emb + pos_emb
 
-        cond_token = self.cond_proj(cond).unsqueeze(1)
-        h = torch.cat([cond_token, h], dim=1)
-
-        if mask is not None:
-            mask = torch.cat([
-                torch.ones(B, 1, dtype=torch.bool, device=mask.device),
-                mask
-            ], dim=1)
+        if cond.dim() == 2:
+            context = self.cond_proj(cond).view(B, self.cond_tokens, self.d_model)
+            if cond_mask is None:
+                cond_mask = torch.ones(B, self.cond_tokens, dtype=torch.bool, device=tokens.device)
+        elif cond.dim() == 3:
+            context = self.cond_seq_proj(cond)
+            if cond_mask is None:
+                cond_mask = torch.ones(B, context.shape[1], dtype=torch.bool, device=tokens.device)
+        else:
+            raise ValueError(f'Expected cond to have rank 2 or 3, got shape {tuple(cond.shape)}')
 
         for block in self.blocks:
-            h = block(h, mask)
+            h = block(h, context, mask, cond_mask)
 
         h = self.ln_f(h)
-        logits = self.head(h)
-        logits = logits[:, 1:, :]
-
-        return logits
+        return self.head(h)  # (B, T, vocab_size)
 
     @torch.no_grad()
     def generate(
@@ -138,6 +214,8 @@ class MotionGPT(nn.Module):
         top_p: Optional[float] = None,
         guidance_scale: float = 0.0,
         cond_uncond: Optional[torch.Tensor] = None,
+        cond_mask: Optional[torch.Tensor] = None,
+        cond_uncond_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B = cond.shape[0]
         device = cond.device
@@ -145,10 +223,10 @@ class MotionGPT(nn.Module):
         tokens = torch.full((B, 1), self.bos_token, dtype=torch.long, device=device)
 
         for _ in range(max_new_tokens):
-            logits = self(tokens, cond)[:, -1, :]
+            logits = self(tokens, cond, cond_mask=cond_mask)[:, -1, :]
 
             if guidance_scale > 0 and cond_uncond is not None:
-                logits_uncond = self(tokens, cond_uncond)[:, -1, :]
+                logits_uncond = self(tokens, cond_uncond, cond_mask=cond_uncond_mask)[:, -1, :]
                 logits = logits_uncond + guidance_scale * (logits - logits_uncond)
 
             logits = logits / temperature
@@ -184,8 +262,8 @@ class MotionGPT(nn.Module):
             result.append(seq)
 
         max_len = max(len(s) for s in result) if result else 0
-        # Use 0 (a valid codebook index) as pad so decode_indices never gets an
-        # out-of-range index that triggers a CUDA device-side assert.
+        # Use 0 (a valid codebook index) as padding so decode_indices never
+        # receives an out-of-range index that could trigger a CUDA assert.
         padded = torch.zeros((B, max_len), dtype=torch.long, device=device)
         for i, seq in enumerate(result):
             if len(seq) > 0:

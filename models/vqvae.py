@@ -1,10 +1,46 @@
-"""VQ-VAE models for motion tokenization."""
+"""VQ-VAE models for motion tokenization.
+
+Architecture:
+  Encoder: Conv1d stem → 2x ResBlock → stride-2 downsample → 2x ResBlock
+           → stride-2 downsample → 2x ResBlock → projection to codebook_dim
+  VQ layer: EMA-updated codebook (1024 entries by default)
+  Decoder: projection from codebook_dim → 2x ResBlock → stride-2 upsample
+           → 2x ResBlock → stride-2 upsample → 2x ResBlock → output Conv1d
+"""
 
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _num_groups(channels: int) -> int:
+    """Return a group count compatible with GroupNorm (divisor of channels, <= 32)."""
+    for g in (32, 16, 8, 4, 2, 1):
+        if channels % g == 0:
+            return g
+    return 1
+
+
+class ResBlock1d(nn.Module):
+    """1-D residual block with GroupNorm and SiLU activations."""
+
+    def __init__(self, channels: int, dropout: float = 0.0):
+        super().__init__()
+        g = _num_groups(channels)
+        self.net = nn.Sequential(
+            nn.GroupNorm(g, channels),
+            nn.SiLU(),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(g, channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
 
 
 class VectorQuantizer(nn.Module):
@@ -53,69 +89,99 @@ class VectorQuantizer(nn.Module):
 
 
 class MotionVQVAE(nn.Module):
-    """VQ-VAE for motion tokenization."""
+    """VQ-VAE for motion tokenization with residual encoder/decoder.
+
+    The encoder and decoder each use ResBlock1d blocks (GroupNorm + SiLU)
+    around stride-2 conv / transposed-conv downsampling layers, giving the
+    model much stronger reconstruction capacity than a plain sequential stack.
+    """
+
     def __init__(
         self,
         feature_dim: int,
-        codebook_size: int = 512,
+        codebook_size: int = 1024,
         codebook_dim: int = 512,
         downsample_rate: int = 4,
         commitment_cost: float = 0.25,
+        enc_channels: int = 512,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.codebook_dim = codebook_dim
         self.downsample_rate = downsample_rate
+        C = enc_channels
 
-        self.encoder = nn.Sequential(
-            nn.Conv1d(feature_dim, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(256, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(512, 512, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(512, codebook_dim, kernel_size=3, padding=1),
-        )
+        # ----- Encoder -----
+        self.enc_in = nn.Conv1d(feature_dim, C, kernel_size=3, padding=1)
+        self.enc_res1 = nn.Sequential(ResBlock1d(C, dropout), ResBlock1d(C, dropout))
+        self.enc_down1 = nn.Conv1d(C, C, kernel_size=4, stride=2, padding=1)
+        self.enc_res2 = nn.Sequential(ResBlock1d(C, dropout), ResBlock1d(C, dropout))
+        self.enc_down2 = nn.Conv1d(C, C, kernel_size=4, stride=2, padding=1)
+        self.enc_res3 = nn.Sequential(ResBlock1d(C, dropout), ResBlock1d(C, dropout))
+        self.enc_out = nn.Conv1d(C, codebook_dim, kernel_size=3, padding=1)
 
         self.vq = VectorQuantizer(codebook_size, codebook_dim, commitment_cost)
 
-        self.decoder = nn.Sequential(
-            nn.Conv1d(codebook_dim, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(512, 512, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(512, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(256, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(256, feature_dim, kernel_size=3, padding=1),
-        )
+        # ----- Decoder -----
+        self.dec_in = nn.Conv1d(codebook_dim, C, kernel_size=3, padding=1)
+        self.dec_res1 = nn.Sequential(ResBlock1d(C, dropout), ResBlock1d(C, dropout))
+        self.dec_up1 = nn.ConvTranspose1d(C, C, kernel_size=4, stride=2, padding=1)
+        self.dec_res2 = nn.Sequential(ResBlock1d(C, dropout), ResBlock1d(C, dropout))
+        self.dec_up2 = nn.ConvTranspose1d(C, C, kernel_size=4, stride=2, padding=1)
+        self.dec_res3 = nn.Sequential(ResBlock1d(C, dropout), ResBlock1d(C, dropout))
+        self.dec_out = nn.Conv1d(C, feature_dim, kernel_size=3, padding=1)
+
+    # ------------------------------------------------------------------
+    # Encoder path (returns channel-last tensors for VQ)
+    # ------------------------------------------------------------------
+
+    def _encode_conv(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, F) → z: (B, T', codebook_dim) channel-last."""
+        h = x.transpose(1, 2)             # (B, F, T)
+        h = self.enc_in(h)
+        h = self.enc_res1(h)
+        h = F.silu(self.enc_down1(h))
+        h = self.enc_res2(h)
+        h = F.silu(self.enc_down2(h))
+        h = self.enc_res3(h)
+        h = self.enc_out(h)
+        return h.transpose(1, 2)          # (B, T', codebook_dim)
+
+    # ------------------------------------------------------------------
+    # Decoder path (accepts channel-last z_q)
+    # ------------------------------------------------------------------
+
+    def _decode_conv(self, z_q: torch.Tensor) -> torch.Tensor:
+        """z_q: (B, T', codebook_dim) → x_recon: (B, T, F)."""
+        h = z_q.transpose(1, 2)           # (B, codebook_dim, T')
+        h = self.dec_in(h)
+        h = self.dec_res1(h)
+        h = F.silu(self.dec_up1(h))
+        h = self.dec_res2(h)
+        h = F.silu(self.dec_up2(h))
+        h = self.dec_res3(h)
+        h = self.dec_out(h)
+        return h.transpose(1, 2)          # (B, T, F)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def encode(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = x.transpose(1, 2)
-        z = self.encoder(x)
-        z = z.transpose(1, 2)
+        z = self._encode_conv(x)
         z_q, indices, _ = self.vq(z)
         return indices, z_q
 
     def decode(self, z_q: torch.Tensor) -> torch.Tensor:
-        z_q = z_q.transpose(1, 2)
-        x = self.decoder(z_q)
-        x = x.transpose(1, 2)
-        return x
+        return self._decode_conv(z_q)
 
     def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:
         z_q = self.vq.embedding(indices)
-        return self.decode(z_q)
+        return self._decode_conv(z_q)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_conv = x.transpose(1, 2)
-        z = self.encoder(x_conv)
-        z = z.transpose(1, 2)
-
+        z = self._encode_conv(x)
         z_q, indices, vq_loss = self.vq(z)
-        x_recon = self.decode(z_q)
-
+        x_recon = self._decode_conv(z_q)
         return x_recon, indices, vq_loss

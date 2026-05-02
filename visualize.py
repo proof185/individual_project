@@ -4,6 +4,7 @@ from typing import Optional, List
 
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML
 
@@ -18,6 +19,22 @@ HUMANML3D_EDGES = [
 ]
 
 
+def _qinv(q: torch.Tensor) -> torch.Tensor:
+    mask = torch.ones_like(q)
+    mask[..., 1:] = -mask[..., 1:]
+    return q * mask
+
+
+def _qrot(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    original_shape = v.shape
+    q = q.contiguous().view(-1, 4)
+    v = v.contiguous().view(-1, 3)
+    qvec = q[:, 1:]
+    uv = torch.cross(qvec, v, dim=1)
+    uuv = torch.cross(qvec, uv, dim=1)
+    return (v + 2 * (q[:, :1] * uv + uuv)).view(original_shape)
+
+
 def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     """
     Recover 3D joint positions from root-relative representation.
@@ -29,51 +46,30 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     Returns:
         joints: 3D joint positions (T, J, 3)
     """
-    data = np.asarray(data, dtype=np.float32)
-    T = data.shape[0]
-    
-    # Root rotation velocity
-    r_rot_vel = data[:, 0]
-    r_rot_ang = np.zeros(T, dtype=np.float32)
-    r_rot_ang[1:] = np.cumsum(r_rot_vel[:-1])
-    
-    # Root position
-    r_pos = np.zeros((T, 3), dtype=np.float32)
-    r_pos[:, 1] = data[:, 3]  # Height
-    
-    # Root velocity in local frame
-    r_vel_local = np.zeros((T, 3), dtype=np.float32)
-    r_vel_local[1:, 0] = data[:-1, 1]
-    r_vel_local[1:, 2] = data[:-1, 2]
-    
-    # Transform to world frame
-    cos_r = np.cos(r_rot_ang)
-    sin_r = np.sin(r_rot_ang)
-    r_vel_world = np.zeros_like(r_vel_local)
-    r_vel_world[:, 0] = cos_r * r_vel_local[:, 0] - sin_r * r_vel_local[:, 2]
-    r_vel_world[:, 2] = sin_r * r_vel_local[:, 0] + cos_r * r_vel_local[:, 2]
-    
-    # Integrate to get position
-    r_pos[:, 0] = np.cumsum(r_vel_world[:, 0])
-    r_pos[:, 2] = np.cumsum(r_vel_world[:, 2])
-    
-    # Relative joint coordinates
-    ric = data[:, 4:4 + (joints_num - 1) * 3]
-    ric = ric.reshape(T, joints_num - 1, 3)
-    
-    # Rotate to world frame
-    positions = np.zeros((T, joints_num - 1, 3), dtype=np.float32)
-    positions[:, :, 0] = cos_r[:, None] * ric[:, :, 0] - sin_r[:, None] * ric[:, :, 2]
-    positions[:, :, 1] = ric[:, :, 1]
-    positions[:, :, 2] = sin_r[:, None] * ric[:, :, 0] + cos_r[:, None] * ric[:, :, 2]
-    
-    # Add root position
-    positions[:, :, 0] += r_pos[:, 0:1]
-    positions[:, :, 2] += r_pos[:, 2:3]
-    
-    # Combine root and other joints
-    joints = np.concatenate([r_pos[:, None, :], positions], axis=1)
-    return joints
+    data_t = torch.as_tensor(np.asarray(data, dtype=np.float32))
+
+    rot_vel = data_t[..., 0]
+    r_rot_ang = torch.zeros_like(rot_vel)
+    r_rot_ang[..., 1:] = rot_vel[..., :-1]
+    r_rot_ang = torch.cumsum(r_rot_ang, dim=-1)
+
+    r_rot_quat = torch.zeros(data_t.shape[:-1] + (4,), dtype=data_t.dtype, device=data_t.device)
+    r_rot_quat[..., 0] = torch.cos(r_rot_ang)
+    r_rot_quat[..., 2] = torch.sin(r_rot_ang)
+
+    r_pos = torch.zeros(data_t.shape[:-1] + (3,), dtype=data_t.dtype, device=data_t.device)
+    r_pos[..., 1:, [0, 2]] = data_t[..., :-1, 1:3]
+    r_pos = _qrot(_qinv(r_rot_quat), r_pos)
+    r_pos = torch.cumsum(r_pos, dim=-2)
+    r_pos[..., 1] = data_t[..., 3]
+
+    positions = data_t[..., 4:(joints_num - 1) * 3 + 4]
+    positions = positions.view(positions.shape[:-1] + (-1, 3))
+    positions = _qrot(_qinv(r_rot_quat[..., None, :]).expand(positions.shape[:-1] + (4,)), positions)
+    positions[..., 0] += r_pos[..., 0:1]
+    positions[..., 2] += r_pos[..., 2:3]
+    joints = torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
+    return joints.cpu().numpy()
 
 
 def animate_skeleton(
@@ -86,6 +82,7 @@ def animate_skeleton(
     interval: int = 80,
     center: bool = True,
     keyframe_indices: Optional[List[int]] = None,
+    bounds_percentile: float = 1.0,
 ):
     """
     Create an animation of a skeleton motion.
@@ -113,9 +110,12 @@ def animate_skeleton(
     if center:
         motion = motion - motion[:, [0], :]
     
-    # Compute bounds
-    mins = motion.reshape(-1, 3).min(axis=0)
-    maxs = motion.reshape(-1, 3).max(axis=0)
+    # Compute plot bounds. Robust percentile bounds avoid tiny-looking skeletons
+    # when a few outlier frames have implausible coordinates.
+    flat = motion.reshape(-1, 3)
+    # Always use 5-95 percentile for robust bounds when reconstructing from features
+    mins = np.percentile(flat, 5.0, axis=0)
+    maxs = np.percentile(flat, 95.0, axis=0)
     span = (maxs - mins).max()
     center_pt = (maxs + mins) / 2
     half = span / 2 * 1.2
@@ -132,7 +132,7 @@ def animate_skeleton(
     ax.set_zlabel("Z")
     
     # Initialize plot elements
-    pts = ax.scatter([], [], [], s=20)
+    pts = ax.scatter([], [], [], s=22, c='royalblue')
     lines = [ax.plot([], [], [], lw=2)[0] for _ in edges]
     
     def init():
@@ -150,6 +150,8 @@ def animate_skeleton(
         # Color based on keyframe
         is_keyframe = keyframe_indices is not None and t in keyframe_indices
         color = 'red' if is_keyframe else 'blue'
+        pts.set_color('red' if is_keyframe else 'royalblue')
+        pts.set_sizes(np.full(J, 30 if is_keyframe else 20))
         
         for k, (i, j) in enumerate(edges):
             lines[k].set_data([xs[i], xs[j]], [ys[i], ys[j]])
@@ -170,6 +172,8 @@ def visualize_motion_file(
     stride: int = 1,
     keyframe_indices: Optional[List[int]] = None,
     show_html: bool = True,
+    center: bool = True,
+    bounds_percentile: float = 1.0,
 ):
     """
     Load and visualize motion from file.
@@ -185,16 +189,29 @@ def visualize_motion_file(
         Animation object or HTML
     """
     vecs = np.load(filepath)
-    joints = recover_from_ric(vecs, joints_num=22)
-    print(f"Loaded motion: {joints.shape}")
+
+    # Auto-detect format
+    if vecs.ndim == 4:
+        # (B, T, J, 3) — T2M-GPT eval output; take first batch item
+        vecs = vecs[0]
+
+    if vecs.ndim == 3 and vecs.shape[-1] == 3:
+        # Already joint positions (T, J, 3)
+        joints = vecs.astype(np.float32)
+        print(f"Loaded joint-positions motion: {joints.shape}")
+    else:
+        # HumanML3D 263-dim feature vectors (T, F)
+        joints = recover_from_ric(vecs, joints_num=22)
+        print(f"Loaded motion (recovered from features): {joints.shape}")
     
     anim = animate_skeleton(
         joints,
         edges=HUMANML3D_EDGES,
         title=title,
         stride=stride,
-        center=True,
+        center=center,
         keyframe_indices=keyframe_indices,
+        bounds_percentile=bounds_percentile,
     )
     
     if show_html:
