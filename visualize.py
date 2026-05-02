@@ -66,6 +66,19 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     positions = data_t[..., 4:(joints_num - 1) * 3 + 4]
     positions = positions.view(positions.shape[:-1] + (-1, 3))
     positions = _qrot(_qinv(r_rot_quat[..., None, :]).expand(positions.shape[:-1] + (4,)), positions)
+
+    # Normalize Y convention across different feature sources.
+    # Some motions store non-root Y as root-relative, others as world Y,
+    # and some accidentally contain root Y twice.
+    y_delta = positions[..., 1] - r_pos[..., 1:2]
+    median_delta = torch.median(y_delta)
+    if median_delta < -0.2:
+        # Non-root Y appears root-relative; convert to world Y.
+        positions[..., 1] += r_pos[..., 1:2]
+    elif median_delta > 0.2:
+        # Non-root Y appears to include root Y twice; remove one root term.
+        positions[..., 1] -= r_pos[..., 1:2]
+
     positions[..., 0] += r_pos[..., 0:1]
     positions[..., 2] += r_pos[..., 2:3]
     joints = torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
