@@ -75,8 +75,12 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     if median_delta < -0.2:
         # Non-root Y appears root-relative; convert to world Y.
         positions[..., 1] += r_pos[..., 1:2]
-    elif median_delta > 0.2:
-        # Non-root Y appears to include root Y twice; remove one root term.
+
+    # Sanity check in root-centered space: at least some non-root joints
+    # (feet/legs) should lie below the root. If not, remove one root-Y term.
+    centered_y = positions[..., 1] - r_pos[..., 1:2]
+    min_centered_y = torch.amin(centered_y, dim=-1)
+    if torch.median(min_centered_y) > -0.15:
         positions[..., 1] -= r_pos[..., 1:2]
 
     positions[..., 0] += r_pos[..., 0:1]
