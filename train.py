@@ -5,7 +5,10 @@ import csv
 import math
 import os
 import random
+import sys
 import time
+import types
+from contextlib import contextmanager
 from datetime import datetime
 from itertools import cycle
 
@@ -24,8 +27,10 @@ from config import CompositeConfig
 from dataset import HUMANML3DCompositeDataset, collate_composite
 from models.vqvae import MotionVQVAE
 from models.gpt import MotionGPT
-from models.diffusion import InbetweenDiffusion, InbetweenTransformer, KeyframeSelector
+from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+from models.selectors import SELECTOR_MODE_CHOICES, build_keyframe_selector
 from utils import (
+    boundary_jerk_loss,
     encode_text,
     encode_text_with_tokens,
     masked_mse,
@@ -69,9 +74,13 @@ def _apply_inbetween_arch_from_checkpoint(cfg, checkpoint_path: str, device: tor
         cfg.inbetween_d_model = int(saved_cfg.get('inbetween_d_model', saved_cfg.get('d_model', cfg.inbetween_d_model)))
         cfg.inbetween_layers = int(saved_cfg.get('inbetween_layers', saved_cfg.get('n_layers', cfg.inbetween_layers)))
         cfg.inbetween_heads = int(saved_cfg.get('inbetween_heads', saved_cfg.get('n_heads', cfg.inbetween_heads)))
+        saved_selector_mode = saved_cfg.get('selector_mode')
+        if saved_selector_mode:
+            cfg.selector_mode = str(saved_selector_mode)
         cfg.selector_d_model = int(saved_cfg.get('selector_d_model', cfg.selector_d_model))
         cfg.selector_layers = int(saved_cfg.get('selector_layers', cfg.selector_layers))
         cfg.selector_heads = int(saved_cfg.get('selector_heads', cfg.selector_heads))
+        cfg.selector_aux_weight = float(saved_cfg.get('selector_aux_weight', cfg.selector_aux_weight))
 
     if isinstance(state, dict):
         if 'frame_in.weight' in state:
@@ -97,6 +106,725 @@ def _safe_float(value):
         return float(value)
     except Exception:
         return None
+
+
+def _default_selector_oracle_ckpt_path() -> str | None:
+    preferred = [
+        os.path.join('checkpoints', 'composite_inbetween_text_alignment_best.pt'),
+        os.path.join('checkpoints', 'composite_inbetween_transformer_best.pt'),
+        os.path.join('checkpoints', 'composite_inbetween_best.pt'),
+    ]
+    for path in preferred:
+        if os.path.exists(path):
+            return path
+
+    candidates = []
+    ckpt_dir = 'checkpoints'
+    if os.path.isdir(ckpt_dir):
+        for name in os.listdir(ckpt_dir):
+            if name.startswith('composite_inbetween_text_alignment_step') and name.endswith('.pt'):
+                candidates.append(os.path.join(ckpt_dir, name))
+            if name.startswith('composite_inbetween_transformer_step') and name.endswith('.pt'):
+                candidates.append(os.path.join(ckpt_dir, name))
+    if not candidates:
+        return None
+
+    def _extract_step(path: str) -> int:
+        base = os.path.basename(path)
+        step = base
+        for prefix in ('composite_inbetween_text_alignment_step', 'composite_inbetween_transformer_step'):
+            if step.startswith(prefix):
+                step = step.removeprefix(prefix)
+                break
+        step = step.removesuffix('.pt')
+        return int(step) if step.isdigit() else -1
+
+    candidates.sort(key=_extract_step)
+    return candidates[-1]
+
+
+def _default_selector_eval_root() -> str | None:
+    candidates = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'T2M-GPT')),
+        os.path.abspath(os.path.join('..', 'T2M-GPT')),
+        os.path.abspath(os.path.join('T2M-GPT')),
+        os.path.abspath('D:/Projects/T2M-GPT'),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _selector_oracle_cache_path(cfg, split: str, oracle_ckpt_path: str) -> str:
+    os.makedirs(os.path.join(cfg.root, 'oracle_labels'), exist_ok=True)
+    ckpt_tag = os.path.splitext(os.path.basename(oracle_ckpt_path))[0]
+    ratio_tag = int(round(float(cfg.selector_target_ratio) * 1000))
+    timestep_tag = int(getattr(cfg, 'selector_oracle_timesteps', 3))
+    selector_tag = str(getattr(cfg, 'selector_mode', 'selector')).strip().lower().replace('-', '_')
+    filename = f'{selector_tag}_{split}_{ckpt_tag}_r{ratio_tag}_t{timestep_tag}.pt'
+    return os.path.join(cfg.root, 'oracle_labels', filename)
+
+
+@contextmanager
+def _pushd(path: str):
+    prev = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+
+@contextmanager
+def _temporary_t2mgpt_imports(t2mgpt_root: str):
+    package_paths = {
+        'dataset': os.path.join(t2mgpt_root, 'dataset'),
+        'models': os.path.join(t2mgpt_root, 'models'),
+        'options': os.path.join(t2mgpt_root, 'options'),
+        'utils': os.path.join(t2mgpt_root, 'utils'),
+    }
+    old_modules = {name: sys.modules.get(name) for name in package_paths}
+    inserted_root = False
+    if t2mgpt_root not in sys.path:
+        sys.path.insert(0, t2mgpt_root)
+        inserted_root = True
+    try:
+        for name, path in package_paths.items():
+            module = types.ModuleType(name)
+            module.__path__ = [path]  # type: ignore[attr-defined]
+            sys.modules[name] = module
+        yield
+    finally:
+        for name, old_module in old_modules.items():
+            if old_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old_module
+        if inserted_root:
+            sys.path.remove(t2mgpt_root)
+
+
+def _load_retrieval_eval_components(t2mgpt_root: str, device: torch.device):
+    with _temporary_t2mgpt_imports(t2mgpt_root), _pushd(t2mgpt_root):
+        from models.evaluator_wrapper import EvaluatorModelWrapper  # type: ignore
+        from options.get_eval_option import get_opt  # type: ignore
+        from utils.word_vectorizer import WordVectorizer  # type: ignore
+
+        dataset_opt_path = os.path.join(
+            t2mgpt_root,
+            'checkpoints',
+            't2m',
+            'Comp_v6_KLD005',
+            'opt.txt',
+        )
+        wrapper_opt = get_opt(dataset_opt_path, device)
+        wrapper_opt.checkpoints_dir = os.path.join(t2mgpt_root, 'checkpoints')
+        eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+        word_vectorizer = WordVectorizer('./glove', 'our_vab')
+    return eval_wrapper, word_vectorizer
+
+
+def _load_oracle_inbetween_model(
+    oracle_ckpt_path: str,
+    feature_dim: int,
+    device: torch.device,
+):
+    oracle_cfg = CompositeConfig()
+    _apply_inbetween_arch_from_checkpoint(oracle_cfg, oracle_ckpt_path, device)
+    oracle_model = InbetweenTransformer(
+        feature_dim=feature_dim,
+        cond_dim=512,
+        d_model=oracle_cfg.inbetween_d_model,
+        n_layers=oracle_cfg.inbetween_layers,
+        n_heads=oracle_cfg.inbetween_heads,
+        dropout=oracle_cfg.dropout,
+        max_len=oracle_cfg.max_len + 10,
+    ).to(device)
+    oracle_diff = InbetweenDiffusion(oracle_cfg.T_diffusion, device=device)
+
+    checkpoint = torch.load(oracle_ckpt_path, map_location=device)
+    state = checkpoint.get('inbetween_ema', checkpoint.get('inbetween'))
+    if state is None:
+        raise ValueError(f'Missing inbetween weights in oracle checkpoint: {oracle_ckpt_path}')
+    oracle_model.load_state_dict(state)
+    oracle_model.eval()
+    return oracle_model, oracle_diff
+
+
+def _parse_selector_text_entry(text_entry: str) -> tuple[str, list[str]]:
+    parts = [part.strip() for part in text_entry.split('#')]
+    caption = parts[0] if parts else ''
+    if len(parts) > 1 and parts[1]:
+        tokens = [tok for tok in parts[1].split(' ') if tok]
+    else:
+        tokens = [f'{word.lower()}/OTHER' for word in caption.split() if word.strip()]
+    return caption, tokens
+
+
+def _vectorize_retrieval_tokens(tokens: list[str], word_vectorizer, max_text_len: int = 20):
+    if len(tokens) < max_text_len:
+        tokens = ['sos/OTHER'] + tokens + ['eos/OTHER']
+        sent_len = len(tokens)
+        tokens = tokens + ['unk/OTHER'] * (max_text_len + 2 - sent_len)
+    else:
+        tokens = tokens[:max_text_len]
+        tokens = ['sos/OTHER'] + tokens + ['eos/OTHER']
+        sent_len = len(tokens)
+
+    pos_one_hots = []
+    word_embeddings = []
+    for token in tokens:
+        word_emb, pos_oh = word_vectorizer[token]
+        pos_one_hots.append(pos_oh[None, :])
+        word_embeddings.append(word_emb[None, :])
+
+    pos_tensor = torch.from_numpy(np.concatenate(pos_one_hots, axis=0)).float()
+    word_tensor = torch.from_numpy(np.concatenate(word_embeddings, axis=0)).float()
+    return word_tensor, pos_tensor, sent_len
+
+
+def _evaluator_text_embeddings(eval_wrapper, word_embs: torch.Tensor, pos_ohot: torch.Tensor, cap_lens: torch.Tensor):
+    with torch.no_grad():
+        return eval_wrapper.text_encoder(
+            word_embs.to(eval_wrapper.device).float(),
+            pos_ohot.to(eval_wrapper.device).float(),
+            cap_lens.to(eval_wrapper.device),
+        )
+
+
+def _evaluator_motion_embeddings(eval_wrapper, motions: torch.Tensor, m_lens: torch.Tensor):
+    with torch.no_grad():
+        motions = motions.to(eval_wrapper.device).float()
+        m_lens = m_lens.to(eval_wrapper.device).long()
+        movements = eval_wrapper.movement_encoder(motions[..., :-4]).detach()
+        enc_lens = (m_lens // eval_wrapper.opt.unit_length).clamp(min=1)
+        return eval_wrapper.motion_encoder(movements, enc_lens)
+
+
+def _build_retrieval_text_embedding_cache(dataset, eval_wrapper, word_vectorizer) -> dict[str, torch.Tensor]:
+    cache = {}
+    for item in dataset.data:
+        embeddings = []
+        for text_entry in item['texts']:
+            _, tokens = _parse_selector_text_entry(text_entry)
+            word_embs, pos_ohot, sent_len = _vectorize_retrieval_tokens(tokens, word_vectorizer)
+            text_embedding = _evaluator_text_embeddings(
+                eval_wrapper,
+                word_embs.unsqueeze(0),
+                pos_ohot.unsqueeze(0),
+                torch.tensor([sent_len], dtype=torch.long),
+            )
+            embeddings.append(text_embedding.squeeze(0).detach().cpu())
+        cache[item['id']] = torch.stack(embeddings, dim=0)
+    return cache
+
+
+def _sample_retrieval_negative_embeddings(
+    sample_id: str,
+    text_embedding_cache: dict[str, torch.Tensor],
+    max_negatives: int,
+) -> torch.Tensor:
+    candidate_ids = [other_id for other_id in text_embedding_cache.keys() if other_id != sample_id]
+    if not candidate_ids:
+        return torch.empty(0, 512)
+    rng = random.Random(f'retrieval_gain:{sample_id}:{max_negatives}')
+    chosen_ids = rng.sample(candidate_ids, k=min(max_negatives, len(candidate_ids)))
+    negatives = [text_embedding_cache[other_id].mean(dim=0) for other_id in chosen_ids]
+    return torch.stack(negatives, dim=0)
+
+
+def _retrieval_margin_from_motion_embeddings(
+    positive_text_embedding: torch.Tensor,
+    negative_text_embeddings: torch.Tensor,
+    motion_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    pos_dist = torch.norm(motion_embeddings - positive_text_embedding.unsqueeze(0), dim=-1)
+    if negative_text_embeddings.numel() == 0:
+        return -pos_dist
+    neg_dist = torch.cdist(motion_embeddings, negative_text_embeddings, p=2.0)
+    best_negative = neg_dist.min(dim=1).values
+    return best_negative - pos_dist
+
+
+def _selector_budget_from_length(length: int, ratio: float) -> int:
+    if length <= 0:
+        return 1
+    min_budget = 3 if length > 2 else length
+    return max(min_budget, min(length, int(round(length * float(ratio)))))
+
+
+def _temporal_diff_norm(x: torch.Tensor, order: int) -> torch.Tensor:
+    out = x
+    for _ in range(order):
+        out = out[:, 1:, :] - out[:, :-1, :]
+    if out.shape[1] == 0:
+        return x.new_zeros(x.shape[0], x.shape[1])
+    score = out.norm(dim=-1)
+    if order > 0:
+        score = torch.nn.functional.pad(score, (order, 0))
+    return score[:, : x.shape[1]]
+
+
+def _information_gain_frame_weights(x0: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    velocity = _temporal_diff_norm(x0, order=1) * valid_mask.float()
+    acceleration = _temporal_diff_norm(x0, order=2) * valid_mask.float()
+    score = velocity + 0.5 * acceleration
+    score = score / score.amax(dim=1, keepdim=True).clamp(min=1e-6)
+    return (1.0 + score) * valid_mask.float()
+
+
+def _sparse_keyframes_from_indices(x0: torch.Tensor, indices: list[int], device: torch.device):
+    idx = torch.tensor(sorted(set(indices)), dtype=torch.long, device=device)
+    keyframes = x0.index_select(0, idx).unsqueeze(0)
+    keyframe_indices = idx.unsqueeze(0)
+    keyframe_mask = torch.ones(1, idx.numel(), dtype=torch.bool, device=device)
+    return keyframes, keyframe_indices, keyframe_mask
+
+
+def _oracle_loss_for_observed_indices(
+    oracle_model,
+    oracle_diff,
+    x0: torch.Tensor,
+    valid_mask: torch.Tensor,
+    cond: torch.Tensor,
+    observed_indices: list[int],
+    frame_weights: torch.Tensor,
+    oracle_timesteps: list[int],
+) -> float:
+    x0_batch = x0.unsqueeze(0)
+    mask_batch = valid_mask.unsqueeze(0)
+    keyframes, keyframe_indices, keyframe_mask = _sparse_keyframes_from_indices(x0, observed_indices, x0.device)
+
+    losses = []
+    for t in oracle_timesteps:
+        t_batch = torch.full((1,), int(t), device=x0.device, dtype=torch.long)
+        noise = torch.randn_like(x0_batch)
+        xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+        xt = oracle_diff._replace_keyframes(xt, keyframes, keyframe_indices, keyframe_mask)
+        x0_hat = oracle_model(xt, t_batch, cond, mask_batch, keyframes, keyframe_indices, keyframe_mask)
+
+        obs_mask = torch.zeros_like(valid_mask, dtype=torch.float32)
+        obs_mask[keyframe_indices[0][keyframe_mask[0]]] = 1.0
+        weights = frame_weights * (1.0 - obs_mask)
+        losses.append(weighted_masked_mse(x0_batch, x0_hat, weights.unsqueeze(0), mask_batch).item())
+
+    return float(sum(losses) / max(1, len(losses)))
+
+
+def _oracle_candidate_losses(
+    oracle_model,
+    oracle_diff,
+    x0: torch.Tensor,
+    valid_mask: torch.Tensor,
+    cond: torch.Tensor,
+    observed_indices: list[int],
+    candidate_indices: list[int],
+    frame_weights: torch.Tensor,
+    oracle_timesteps: list[int],
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    if not candidate_indices:
+        return torch.empty(0, device=x0.device)
+
+    losses_out = []
+    T = x0.shape[0]
+    mask_batch_template = valid_mask.unsqueeze(0)
+    x0_single = x0.unsqueeze(0)
+
+    for start in range(0, len(candidate_indices), chunk_size):
+        chunk = candidate_indices[start:start + chunk_size]
+        C = len(chunk)
+        mask_batch = mask_batch_template.expand(C, -1)
+        x0_batch = x0_single.expand(C, -1, -1)
+        obs_mask = torch.zeros(C, T, device=x0.device, dtype=torch.float32)
+        if observed_indices:
+            obs_mask[:, observed_indices] = 1.0
+        obs_mask[torch.arange(C, device=x0.device), torch.tensor(chunk, device=x0.device)] = 1.0
+
+        keyframe_canvas = x0_batch
+        weights = frame_weights.unsqueeze(0).expand(C, -1) * (1.0 - obs_mask)
+        loss_accum = 0.0
+
+        for t in oracle_timesteps:
+            t_batch = torch.full((C,), int(t), device=x0.device, dtype=torch.long)
+            noise = torch.randn_like(x0_batch)
+            xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+            xt = oracle_diff._replace_keyframes(
+                xt,
+                observation_mask=obs_mask,
+                keyframe_canvas=keyframe_canvas,
+            )
+            x0_hat = oracle_model(
+                xt,
+                t_batch,
+                cond.expand(C, -1),
+                mask_batch,
+                observation_mask=obs_mask,
+                keyframe_canvas=keyframe_canvas,
+            )
+            loss_accum = loss_accum + ((x0_batch - x0_hat) ** 2 * weights.unsqueeze(-1)).sum(dim=(1, 2)) / (
+                weights.sum(dim=1).clamp(min=1e-8) * x0.shape[-1]
+            )
+
+        losses_out.append(loss_accum / max(1, len(oracle_timesteps)))
+
+    return torch.cat(losses_out, dim=0)
+
+
+def _oracle_retrieval_margin_for_observed_indices(
+    oracle_model,
+    oracle_diff,
+    eval_wrapper,
+    x0: torch.Tensor,
+    valid_mask: torch.Tensor,
+    cond: torch.Tensor,
+    observed_indices: list[int],
+    positive_text_embedding: torch.Tensor,
+    negative_text_embeddings: torch.Tensor,
+    oracle_timesteps: list[int],
+) -> float:
+    x0_batch = x0.unsqueeze(0)
+    mask_batch = valid_mask.unsqueeze(0)
+    obs_mask = torch.zeros_like(valid_mask, dtype=torch.float32)
+    obs_mask[observed_indices] = 1.0
+    obs_mask_batch = obs_mask.unsqueeze(0)
+    keyframe_canvas = x0_batch
+    motion_lengths = torch.tensor([x0.shape[0]], dtype=torch.long, device=x0.device)
+
+    margins = []
+    for t in oracle_timesteps:
+        t_batch = torch.full((1,), int(t), device=x0.device, dtype=torch.long)
+        noise = torch.randn_like(x0_batch)
+        xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+        xt = oracle_diff._replace_keyframes(
+            xt,
+            observation_mask=obs_mask_batch,
+            keyframe_canvas=keyframe_canvas,
+        )
+        x0_hat = oracle_model(
+            xt,
+            t_batch,
+            cond,
+            mask_batch,
+            observation_mask=obs_mask_batch,
+            keyframe_canvas=keyframe_canvas,
+        )
+        motion_embeddings = _evaluator_motion_embeddings(eval_wrapper, x0_hat, motion_lengths)
+        margin = _retrieval_margin_from_motion_embeddings(
+            positive_text_embedding,
+            negative_text_embeddings,
+            motion_embeddings,
+        )
+        margins.append(float(margin[0].item()))
+    return float(sum(margins) / max(1, len(margins)))
+
+
+def _oracle_candidate_retrieval_margins(
+    oracle_model,
+    oracle_diff,
+    eval_wrapper,
+    x0: torch.Tensor,
+    valid_mask: torch.Tensor,
+    cond: torch.Tensor,
+    observed_indices: list[int],
+    candidate_indices: list[int],
+    positive_text_embedding: torch.Tensor,
+    negative_text_embeddings: torch.Tensor,
+    oracle_timesteps: list[int],
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    if not candidate_indices:
+        return torch.empty(0, device=x0.device)
+
+    margins_out = []
+    T = x0.shape[0]
+    mask_batch_template = valid_mask.unsqueeze(0)
+    x0_single = x0.unsqueeze(0)
+
+    for start in range(0, len(candidate_indices), chunk_size):
+        chunk = candidate_indices[start:start + chunk_size]
+        C = len(chunk)
+        mask_batch = mask_batch_template.expand(C, -1)
+        x0_batch = x0_single.expand(C, -1, -1)
+        obs_mask = torch.zeros(C, T, device=x0.device, dtype=torch.float32)
+        if observed_indices:
+            obs_mask[:, observed_indices] = 1.0
+        obs_mask[torch.arange(C, device=x0.device), torch.tensor(chunk, device=x0.device)] = 1.0
+
+        keyframe_canvas = x0_batch
+        motion_lengths = torch.full((C,), x0.shape[0], dtype=torch.long, device=x0.device)
+        margin_accum = 0.0
+
+        for t in oracle_timesteps:
+            t_batch = torch.full((C,), int(t), device=x0.device, dtype=torch.long)
+            noise = torch.randn_like(x0_batch)
+            xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+            xt = oracle_diff._replace_keyframes(
+                xt,
+                observation_mask=obs_mask,
+                keyframe_canvas=keyframe_canvas,
+            )
+            x0_hat = oracle_model(
+                xt,
+                t_batch,
+                cond.expand(C, -1),
+                mask_batch,
+                observation_mask=obs_mask,
+                keyframe_canvas=keyframe_canvas,
+            )
+            motion_embeddings = _evaluator_motion_embeddings(eval_wrapper, x0_hat, motion_lengths)
+            margin_accum = margin_accum + _retrieval_margin_from_motion_embeddings(
+                positive_text_embedding,
+                negative_text_embeddings,
+                motion_embeddings,
+            )
+
+        margins_out.append(margin_accum / max(1, len(oracle_timesteps)))
+
+    return torch.cat(margins_out, dim=0)
+
+
+def _build_information_gain_target_for_item(
+    oracle_model,
+    oracle_diff,
+    motion: torch.Tensor,
+    cond: torch.Tensor,
+    selector_target_ratio: float,
+    oracle_timesteps: list[int],
+) -> torch.Tensor:
+    x0 = motion.float()
+    valid_mask = torch.ones(x0.shape[0], dtype=torch.bool, device=x0.device)
+    budget = _selector_budget_from_length(int(valid_mask.sum().item()), selector_target_ratio)
+    observed = [0, max(0, x0.shape[0] - 1)]
+    target = torch.zeros(x0.shape[0], dtype=torch.float32, device=x0.device)
+    target[observed] = 1.0
+    frame_weights = _information_gain_frame_weights(x0.unsqueeze(0), valid_mask.unsqueeze(0))[0]
+
+    baseline_loss = _oracle_loss_for_observed_indices(
+        oracle_model,
+        oracle_diff,
+        x0,
+        valid_mask,
+        cond,
+        observed,
+        frame_weights,
+        oracle_timesteps,
+    )
+
+    while len(observed) < budget:
+        candidates = [idx for idx in range(1, x0.shape[0] - 1) if idx not in observed]
+        if not candidates:
+            break
+        candidate_losses = _oracle_candidate_losses(
+            oracle_model,
+            oracle_diff,
+            x0,
+            valid_mask,
+            cond,
+            observed,
+            candidates,
+            frame_weights,
+            oracle_timesteps,
+        )
+        gains = baseline_loss - candidate_losses
+        best_pos = int(torch.argmax(gains).item())
+        best_idx = candidates[best_pos]
+        best_gain = float(max(gains[best_pos].item(), 0.0))
+        observed.append(best_idx)
+        baseline_loss = float(candidate_losses[best_pos].item())
+        target[best_idx] = max(target[best_idx].item(), best_gain)
+
+    target = target * valid_mask.float()
+    max_val = target.max().clamp(min=1e-6)
+    target = target / max_val
+    target[0] = 1.0
+    target[max(0, x0.shape[0] - 1)] = 1.0
+    return target.cpu()
+
+
+def _build_retrieval_gain_target_for_item(
+    oracle_model,
+    oracle_diff,
+    eval_wrapper,
+    motion: torch.Tensor,
+    cond: torch.Tensor,
+    positive_text_embedding: torch.Tensor,
+    negative_text_embeddings: torch.Tensor,
+    selector_target_ratio: float,
+    oracle_timesteps: list[int],
+) -> torch.Tensor:
+    x0 = motion.float()
+    valid_mask = torch.ones(x0.shape[0], dtype=torch.bool, device=x0.device)
+    budget = _selector_budget_from_length(int(valid_mask.sum().item()), selector_target_ratio)
+    observed = [0, max(0, x0.shape[0] - 1)]
+    target = torch.zeros(x0.shape[0], dtype=torch.float32, device=x0.device)
+    target[observed] = 1.0
+
+    baseline_margin = _oracle_retrieval_margin_for_observed_indices(
+        oracle_model,
+        oracle_diff,
+        eval_wrapper,
+        x0,
+        valid_mask,
+        cond,
+        observed,
+        positive_text_embedding,
+        negative_text_embeddings,
+        oracle_timesteps,
+    )
+
+    while len(observed) < budget:
+        candidates = [idx for idx in range(1, x0.shape[0] - 1) if idx not in observed]
+        if not candidates:
+            break
+        candidate_margins = _oracle_candidate_retrieval_margins(
+            oracle_model,
+            oracle_diff,
+            eval_wrapper,
+            x0,
+            valid_mask,
+            cond,
+            observed,
+            candidates,
+            positive_text_embedding,
+            negative_text_embeddings,
+            oracle_timesteps,
+        )
+        gains = candidate_margins - baseline_margin
+        best_pos = int(torch.argmax(gains).item())
+        best_idx = candidates[best_pos]
+        best_gain = float(max(gains[best_pos].item(), 0.0))
+        observed.append(best_idx)
+        baseline_margin = float(candidate_margins[best_pos].item())
+        target[best_idx] = max(target[best_idx].item(), best_gain)
+
+    target = target * valid_mask.float()
+    max_val = target.max().clamp(min=1e-6)
+    target = target / max_val
+    target[0] = 1.0
+    target[max(0, x0.shape[0] - 1)] = 1.0
+    return target.cpu()
+
+
+def _prepare_information_gain_oracle_targets(dataset, cfg, device: torch.device, oracle_ckpt_path: str):
+    cache_path = _selector_oracle_cache_path(cfg, dataset.split, oracle_ckpt_path)
+    if os.path.exists(cache_path):
+        print(f'Loading information-gain oracle cache: {cache_path}')
+        return torch.load(cache_path)
+
+    oracle_model, oracle_diff = _load_oracle_inbetween_model(oracle_ckpt_path, dataset.feature_dim, device)
+    oracle_timesteps_count = max(1, int(getattr(cfg, 'selector_oracle_timesteps', 3)))
+    oracle_timesteps = torch.linspace(1, cfg.T_diffusion - 1, steps=oracle_timesteps_count).round().long().tolist()
+
+    oracle_targets = {}
+    print(f'Building information-gain oracle cache for split={dataset.split} using {oracle_ckpt_path}')
+    for idx, item in enumerate(dataset.data, start=1):
+        motion = item['motion'].to(device)
+        if dataset.normalize:
+            motion = (motion - dataset.mean.to(device)) / (dataset.std.to(device) + 1e-8)
+        cond = dataset.embeddings[item['id']].mean(dim=0, keepdim=True).to(device)
+        oracle_targets[item['id']] = _build_information_gain_target_for_item(
+            oracle_model,
+            oracle_diff,
+            motion,
+            cond,
+            cfg.selector_target_ratio,
+            oracle_timesteps,
+        )
+        if idx % 100 == 0:
+            print(f'  oracle labels: {idx}/{len(dataset.data)}')
+
+    torch.save(oracle_targets, cache_path)
+    print(f'Saved information-gain oracle cache: {cache_path}')
+    return oracle_targets
+
+
+def _prepare_retrieval_gain_oracle_targets(dataset, cfg, device: torch.device, oracle_ckpt_path: str):
+    cache_path = _selector_oracle_cache_path(cfg, dataset.split, oracle_ckpt_path)
+    if os.path.exists(cache_path):
+        print(f'Loading retrieval-gain oracle cache: {cache_path}')
+        return torch.load(cache_path)
+
+    eval_root = cfg.selector_eval_root or _default_selector_eval_root()
+    if not eval_root:
+        raise FileNotFoundError(
+            'Retrieval-gain selector requires a T2M-GPT eval root. '
+            'Pass --selector-eval-root or place T2M-GPT adjacent to this repo.'
+        )
+    eval_root = os.path.abspath(eval_root)
+    eval_wrapper, word_vectorizer = _load_retrieval_eval_components(eval_root, device)
+    text_embedding_cache = _build_retrieval_text_embedding_cache(dataset, eval_wrapper, word_vectorizer)
+    oracle_model, oracle_diff = _load_oracle_inbetween_model(oracle_ckpt_path, dataset.feature_dim, device)
+    oracle_timesteps_count = max(1, int(getattr(cfg, 'selector_oracle_timesteps', 3)))
+    oracle_timesteps = torch.linspace(1, cfg.T_diffusion - 1, steps=oracle_timesteps_count).round().long().tolist()
+    negative_count = max(1, int(getattr(cfg, 'selector_retrieval_negatives', 31)))
+
+    oracle_targets = {}
+    print(f'Building retrieval-gain oracle cache for split={dataset.split} using {oracle_ckpt_path}')
+    for idx, item in enumerate(dataset.data, start=1):
+        motion = item['motion'].to(device)
+        if dataset.normalize:
+            motion = (motion - dataset.mean.to(device)) / (dataset.std.to(device) + 1e-8)
+        cond = dataset.embeddings[item['id']].mean(dim=0, keepdim=True).to(device)
+        positive_text_embedding = text_embedding_cache[item['id']].mean(dim=0).to(device)
+        negative_text_embeddings = _sample_retrieval_negative_embeddings(
+            item['id'],
+            text_embedding_cache,
+            negative_count,
+        ).to(device)
+        oracle_targets[item['id']] = _build_retrieval_gain_target_for_item(
+            oracle_model,
+            oracle_diff,
+            eval_wrapper,
+            motion,
+            cond,
+            positive_text_embedding,
+            negative_text_embeddings,
+            cfg.selector_target_ratio,
+            oracle_timesteps,
+        )
+        if idx % 100 == 0:
+            print(f'  oracle labels: {idx}/{len(dataset.data)}')
+
+    torch.save(oracle_targets, cache_path)
+    print(f'Saved retrieval-gain oracle cache: {cache_path}')
+    return oracle_targets
+
+
+def _selector_mode_uses_oracle_targets(selector_mode: str) -> bool:
+    return str(selector_mode).strip().lower() in {'information_gain', 'retrieval_gain'}
+
+
+def _prepare_selector_oracle_targets(dataset, cfg, device: torch.device, oracle_ckpt_path: str):
+    mode = str(cfg.selector_mode).strip().lower()
+    if mode == 'information_gain':
+        return _prepare_information_gain_oracle_targets(dataset, cfg, device, oracle_ckpt_path)
+    if mode == 'retrieval_gain':
+        return _prepare_retrieval_gain_oracle_targets(dataset, cfg, device, oracle_ckpt_path)
+    raise ValueError(f'Selector mode {mode!r} does not use oracle targets.')
+
+
+def _gather_selector_oracle_targets(batch, oracle_targets: dict | None, device: torch.device):
+    if not oracle_targets:
+        return None
+    if any(sample_id not in oracle_targets for sample_id in batch['ids']):
+        return None
+
+    lengths = batch['lengths']
+    T_max = int(lengths.max().item())
+    out = torch.zeros(len(batch['ids']), T_max, dtype=torch.float32, device=device)
+    for i, sample_id in enumerate(batch['ids']):
+        target = oracle_targets[sample_id].to(device)
+        out[i, :target.shape[0]] = target[:T_max]
+    return out
+
+
+def _default_inbetween_ckpt_prefix(cfg) -> str:
+    if not cfg.use_learned_keyframe_selector:
+        return 'composite_inbetween_dataset'
+    selector_mode = str(cfg.selector_mode).strip().lower().replace('-', '_')
+    return f'composite_inbetween_{selector_mode}'
 
 
 def _init_metrics_logger(stage_name: str, columns: list[str]):
@@ -248,6 +976,7 @@ def _compute_inbetween_loss(
     keyframe_selector,
     selector_budget_weight: float,
     selector_entropy_weight: float,
+    selector_oracle_target: torch.Tensor | None = None,
 ):
     B = x0.shape[0]
     t = torch.randint(0, cfg.T_diffusion, (B,), device=x0.device)
@@ -258,8 +987,10 @@ def _compute_inbetween_loss(
     selector_ratio = None
     selector_budget_loss = x0.new_tensor(0.0)
     selector_entropy_loss = x0.new_tensor(0.0)
+    selector_aux_loss = x0.new_tensor(0.0)
 
     if keyframe_selector is not None:
+        selector_is_trainable = getattr(keyframe_selector, 'is_trainable', True)
         selector_probs, selector_mask_st = keyframe_selector(x0, mask, cond=cond)
         keyframe_canvas = selector_mask_st.unsqueeze(-1) * x0
 
@@ -281,14 +1012,24 @@ def _compute_inbetween_loss(
         loss = weighted_masked_mse(x0, x0_hat, non_keyframe_weights, mask)
 
         selector_ratio = (selector_probs * mask.float()).sum() / (mask.float().sum() + 1e-8)
-        selector_budget_loss = (selector_ratio - cfg.selector_target_ratio) ** 2
-        p = selector_probs.clamp(1e-6, 1 - 1e-6)
-        entropy = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
-        selector_entropy_loss = (entropy * mask.float()).sum() / (mask.float().sum() + 1e-8)
+        if selector_is_trainable:
+            selector_budget_loss = (selector_ratio - cfg.selector_target_ratio) ** 2
+            p = selector_probs.clamp(1e-6, 1 - 1e-6)
+            entropy = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
+            selector_entropy_loss = (entropy * mask.float()).sum() / (mask.float().sum() + 1e-8)
+            selector_aux_loss = keyframe_selector.compute_auxiliary_loss(
+                x0,
+                mask,
+                cond,
+                selector_probs,
+                selector_mask_st,
+                oracle_target=selector_oracle_target,
+            )
         loss = (
             loss
             + selector_budget_weight * selector_budget_loss
             + selector_entropy_weight * selector_entropy_loss
+            + float(cfg.selector_aux_weight) * selector_aux_loss
         )
 
         keyframes, keyframe_indices, keyframe_mask = _frame_mask_to_sparse_keyframes(
@@ -306,11 +1047,22 @@ def _compute_inbetween_loss(
             non_keyframe_mask[b, valid_idx] = False
         loss = masked_mse(x0, x0_hat, non_keyframe_mask)
 
+    boundary_jerk_weight = float(getattr(cfg, 'boundary_jerk_weight', 0.0))
+    if boundary_jerk_weight > 0.0:
+        loss = loss + boundary_jerk_weight * boundary_jerk_loss(
+            x0,
+            x0_hat,
+            mask,
+            keyframe_indices,
+            keyframe_mask,
+        )
+
     return {
         'loss': loss,
         'selector_ratio': selector_ratio,
         'selector_budget': selector_budget_loss,
         'selector_entropy': selector_entropy_loss,
+        'selector_aux': selector_aux_loss,
     }
 
 
@@ -324,6 +1076,7 @@ def _evaluate_inbetween(
     empty_emb,
     cfg,
     device,
+    selector_oracle_targets: dict | None = None,
 ):
     inbetween_model.eval()
     if keyframe_selector is not None:
@@ -340,6 +1093,7 @@ def _evaluate_inbetween(
         keyframe_indices = batch['keyframe_indices'].to(device, non_blocking=True)
         keyframe_mask = batch['keyframe_mask'].to(device, non_blocking=True)
         cond = _build_cond(batch, dataset, empty_emb, p_uncond=0.0)
+        selector_oracle_target = _gather_selector_oracle_targets(batch, selector_oracle_targets, device)
 
         out = _compute_inbetween_loss(
             inbetween_model,
@@ -354,6 +1108,7 @@ def _evaluate_inbetween(
             keyframe_selector,
             selector_budget_weight=cfg.selector_budget_weight,
             selector_entropy_weight=cfg.selector_entropy_weight,
+            selector_oracle_target=selector_oracle_target,
         )
         loss_values.append(out['loss'].item())
 
@@ -384,6 +1139,11 @@ def main(
     min_lr_ratio: float | None = None,
     inbetween_lr: float | None = None,
     selector_lr: float | None = None,
+    selector_mode: str | None = None,
+    selector_oracle_ckpt: str | None = None,
+    selector_oracle_timesteps: int | None = None,
+    selector_eval_root: str | None = None,
+    selector_retrieval_negatives: int | None = None,
     ema_decay: float | None = None,
     selector_curriculum_fraction: float | None = None,
     val_interval: int | None = None,
@@ -429,6 +1189,18 @@ def main(
         cfg.inbetween_lr = float(inbetween_lr)
     if selector_lr is not None:
         cfg.selector_lr = float(selector_lr)
+    if selector_mode is not None:
+        cfg.selector_mode = selector_mode.strip().lower()
+        if cfg.selector_mode not in SELECTOR_MODE_CHOICES:
+            raise ValueError(f"Unknown selector mode {cfg.selector_mode!r}. Expected one of {SELECTOR_MODE_CHOICES}.")
+    if selector_oracle_ckpt is not None:
+        cfg.selector_oracle_ckpt_path = selector_oracle_ckpt.strip()
+    if selector_oracle_timesteps is not None:
+        cfg.selector_oracle_timesteps = max(1, int(selector_oracle_timesteps))
+    if selector_eval_root is not None:
+        cfg.selector_eval_root = selector_eval_root.strip()
+    if selector_retrieval_negatives is not None:
+        cfg.selector_retrieval_negatives = max(1, int(selector_retrieval_negatives))
     if ema_decay is not None:
         cfg.ema_decay = float(ema_decay)
     if selector_curriculum_fraction is not None:
@@ -440,11 +1212,14 @@ def main(
     if grad_accum_steps is not None:
         cfg.grad_accum_steps = max(1, int(grad_accum_steps))
     if inbetween_ckpt_prefix is None or not inbetween_ckpt_prefix.strip():
-        inbetween_ckpt_prefix = 'composite_inbetween'
+        inbetween_ckpt_prefix = _default_inbetween_ckpt_prefix(cfg)
     inbetween_ckpt_prefix = inbetween_ckpt_prefix.strip()
     if stage in {'all', 'inbetween'}:
         selector_state = 'enabled' if cfg.use_learned_keyframe_selector else 'disabled'
-        print(f"Keyframe strategy (dataset fallback): {cfg.keyframe_strategy} | learned selector: {selector_state}")
+        print(
+            f"Keyframe strategy (dataset fallback): {cfg.keyframe_strategy} | "
+            f"selector: {selector_state} ({cfg.selector_mode})"
+        )
     else:
         print(f"Keyframe strategy: {cfg.keyframe_strategy}")
 
@@ -464,6 +1239,7 @@ def main(
                 f"layers={cfg.inbetween_layers}",
                 f"selector_d_model={cfg.selector_d_model}",
                 f"selector_layers={cfg.selector_layers}",
+                f"selector_mode={cfg.selector_mode}",
             )
     
     # Load normalization statistics
@@ -545,6 +1321,20 @@ def main(
             print(f"Validation dataset size: {len(val_dataset)} ({cfg.val_split})")
         else:
             print(f"Validation split file not found: {val_split_file}; best-checkpoint selection disabled.")
+
+    selector_oracle_targets = None
+    val_selector_oracle_targets = None
+    if stage in {'all', 'inbetween'} and cfg.use_learned_keyframe_selector and _selector_mode_uses_oracle_targets(cfg.selector_mode):
+        oracle_ckpt_path = cfg.selector_oracle_ckpt_path or _default_selector_oracle_ckpt_path()
+        if not oracle_ckpt_path:
+            raise FileNotFoundError(
+                f'{cfg.selector_mode} selector requires an oracle diffusion checkpoint. '
+                'Pass --selector-oracle-ckpt or train a transformer in-between checkpoint first.'
+            )
+        oracle_ckpt_path = os.path.abspath(oracle_ckpt_path)
+        selector_oracle_targets = _prepare_selector_oracle_targets(dataset, cfg, device, oracle_ckpt_path)
+        if val_dataset is not None:
+            val_selector_oracle_targets = _prepare_selector_oracle_targets(val_dataset, cfg, device, oracle_ckpt_path)
     
     loader_kwargs = {
         'batch_size': cfg.batch_size,
@@ -609,7 +1399,8 @@ def main(
 
     keyframe_selector = None
     if cfg.use_learned_keyframe_selector:
-        keyframe_selector = KeyframeSelector(
+        keyframe_selector = build_keyframe_selector(
+            mode=cfg.selector_mode,
             feature_dim=Fdim,
             cond_dim=512,
             d_model=cfg.selector_d_model,
@@ -618,8 +1409,12 @@ def main(
             dropout=cfg.selector_dropout,
             max_len=cfg.max_len + 10,
             threshold=cfg.selector_threshold,
+            budget_ratio=cfg.selector_target_ratio,
         ).to(device)
-        print(f'Keyframe selector params: {sum(p.numel() for p in keyframe_selector.parameters())/1e6:.2f}M')
+        print(
+            f"Keyframe selector [{cfg.selector_mode}] params: "
+            f"{sum(p.numel() for p in keyframe_selector.parameters())/1e6:.2f}M"
+        )
     
     diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
     
@@ -673,6 +1468,8 @@ def main(
             keyframe_selector=keyframe_selector,
             resume_ckpt_path=inbetween_resume,
             ckpt_prefix=inbetween_ckpt_prefix,
+            selector_oracle_targets=selector_oracle_targets,
+            val_selector_oracle_targets=val_selector_oracle_targets,
         )
     
     print("Training complete!")
@@ -1100,6 +1897,8 @@ def train_inbetween(
     keyframe_selector=None,
     resume_ckpt_path: str | None = None,
     ckpt_prefix: str = 'composite_inbetween',
+    selector_oracle_targets: dict | None = None,
+    val_selector_oracle_targets: dict | None = None,
 ):
     """Stage 2: Train Diffusion In-betweening."""
     inbetween_final_ckpt_path = f'checkpoints/{ckpt_prefix}_step{cfg.inbetween_steps}.pt'
@@ -1125,11 +1924,17 @@ def train_inbetween(
         )
 
     inbetween_lr = float(cfg.inbetween_lr if cfg.inbetween_lr is not None else cfg.lr)
+    selector_has_trainable_params = False
+    selector_params = []
     if keyframe_selector is not None:
+        selector_params = [p for p in keyframe_selector.parameters() if p.requires_grad]
+        selector_has_trainable_params = len(selector_params) > 0 and getattr(keyframe_selector, 'is_trainable', True)
+
+    if selector_has_trainable_params:
         selector_lr = float(cfg.selector_lr if cfg.selector_lr is not None else (inbetween_lr * cfg.selector_lr_scale))
         param_groups = [
             {'params': list(inbetween_model.parameters()), 'lr': inbetween_lr, 'name': 'inbetween'},
-            {'params': list(keyframe_selector.parameters()), 'lr': selector_lr, 'name': 'selector'},
+            {'params': selector_params, 'lr': selector_lr, 'name': 'selector'},
         ]
         base_lrs = [inbetween_lr, selector_lr]
     else:
@@ -1142,7 +1947,7 @@ def train_inbetween(
         all_params.extend(group['params'])
 
     ema_inbetween_state = _clone_state_dict(inbetween_model)
-    ema_selector_state = _clone_state_dict(keyframe_selector) if keyframe_selector is not None else None
+    ema_selector_state = _clone_state_dict(keyframe_selector) if selector_has_trainable_params else None
 
     metrics_logger = _init_metrics_logger(
         'inbetween',
@@ -1154,9 +1959,11 @@ def train_inbetween(
             'lr_selector',
             'selector_budget_weight',
             'selector_entropy_weight',
+            'selector_aux_weight',
             'selector_ratio',
             'selector_budget',
             'selector_entropy',
+            'selector_aux',
         ],
     )
     print(f"In-between metrics CSV: {metrics_logger['csv_path']}")
@@ -1171,7 +1978,7 @@ def train_inbetween(
         if keyframe_selector is not None:
             if inbetween_ckpt.get('selector') is not None:
                 keyframe_selector.load_state_dict(inbetween_ckpt['selector'])
-                if inbetween_ckpt.get('selector_ema') is not None:
+                if selector_has_trainable_params and inbetween_ckpt.get('selector_ema') is not None:
                     ema_selector_state = {k: v.detach().clone() for k, v in inbetween_ckpt['selector_ema'].items()}
             else:
                 print('Warning: resume checkpoint has no selector state; selector will train from scratch.')
@@ -1204,7 +2011,10 @@ def train_inbetween(
     grad_accum_steps = max(1, int(cfg.grad_accum_steps))
     
     if keyframe_selector is not None:
-        print(f"Stage 2: Training Diffusion In-Betweening with LEARNED keyframe selector (target ratio={cfg.selector_target_ratio})...")
+        print(
+            f"Stage 2: Training Diffusion In-Betweening with selector={cfg.selector_mode} "
+            f"(target ratio={cfg.selector_target_ratio})..."
+        )
     else:
         print(f"Stage 2: Training Diffusion In-Betweening (keyframe interval={cfg.keyframe_interval})...")
     
@@ -1235,6 +2045,7 @@ def train_inbetween(
         selector_ratio_running = 0.0
         selector_budget_running = 0.0
         selector_entropy_running = 0.0
+        selector_aux_running = 0.0
         selector_metric_count = 0
 
         for _ in range(grad_accum_steps):
@@ -1244,6 +2055,7 @@ def train_inbetween(
             keyframes = batch['keyframes'].to(device, non_blocking=True)
             keyframe_indices = batch['keyframe_indices'].to(device, non_blocking=True)
             keyframe_mask = batch['keyframe_mask'].to(device, non_blocking=True)
+            selector_oracle_target = _gather_selector_oracle_targets(batch, selector_oracle_targets, device)
 
             cond = _build_cond(batch, dataset, empty_emb, p_uncond=cfg.p_uncond)
 
@@ -1260,6 +2072,7 @@ def train_inbetween(
                 keyframe_selector,
                 selector_budget_weight=selector_budget_weight,
                 selector_entropy_weight=selector_entropy_weight,
+                selector_oracle_target=selector_oracle_target,
             )
             loss = out['loss']
             (loss / grad_accum_steps).backward()
@@ -1270,6 +2083,7 @@ def train_inbetween(
                 selector_ratio_running += out['selector_ratio'].item()
                 selector_budget_running += out['selector_budget'].item()
                 selector_entropy_running += out['selector_entropy'].item()
+                selector_aux_running += out['selector_aux'].item()
 
         nn.utils.clip_grad_norm_(all_params, cfg.grad_clip)
         inbetween_optimizer.step()
@@ -1278,13 +2092,15 @@ def train_inbetween(
         selector_ratio_avg = None
         selector_budget_avg = None
         selector_entropy_avg = None
+        selector_aux_avg = None
         if selector_metric_count > 0:
             selector_ratio_avg = selector_ratio_running / selector_metric_count
             selector_budget_avg = selector_budget_running / selector_metric_count
             selector_entropy_avg = selector_entropy_running / selector_metric_count
+            selector_aux_avg = selector_aux_running / selector_metric_count
 
         _update_ema_state(ema_inbetween_state, inbetween_model, cfg.ema_decay)
-        if keyframe_selector is not None and ema_selector_state is not None:
+        if selector_has_trainable_params and keyframe_selector is not None and ema_selector_state is not None:
             _update_ema_state(ema_selector_state, keyframe_selector, cfg.ema_decay)
 
         val_loss = None
@@ -1293,7 +2109,7 @@ def train_inbetween(
             eval_selector_orig = _clone_state_dict(keyframe_selector) if keyframe_selector is not None else None
             if cfg.use_ema_for_sampling:
                 inbetween_model.load_state_dict(ema_inbetween_state)
-                if keyframe_selector is not None and ema_selector_state is not None:
+                if selector_has_trainable_params and keyframe_selector is not None and ema_selector_state is not None:
                     keyframe_selector.load_state_dict(ema_selector_state)
 
             val_loss = _evaluate_inbetween(
@@ -1305,6 +2121,7 @@ def train_inbetween(
                 empty_emb,
                 cfg,
                 device,
+                selector_oracle_targets=val_selector_oracle_targets,
             )
 
             inbetween_model.load_state_dict(eval_inbetween_orig)
@@ -1319,7 +2136,7 @@ def train_inbetween(
                     'inbetween': inbetween_model.state_dict(),
                     'inbetween_ema': ema_inbetween_state,
                     'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
-                    'selector_ema': ema_selector_state if keyframe_selector is not None else None,
+                    'selector_ema': ema_selector_state if selector_has_trainable_params else None,
                     'optimizer': inbetween_optimizer.state_dict(),
                     'step': step,
                     'best_step': best_step,
@@ -1354,6 +2171,7 @@ def train_inbetween(
                     f"sel_ratio {selector_ratio_avg:.4f} | "
                     f"sel_budget {selector_budget_avg:.5f} | "
                     f"sel_entropy {selector_entropy_avg:.5f} | "
+                    f"sel_aux {selector_aux_avg:.5f} | "
                     f"lr_d {lr_inbetween:.2e} | "
                     f"lr_s {lr_selector if lr_selector is not None else float('nan'):.2e} | "
                     f"val {val_loss if val_loss is not None else float('nan'):.5f} | "
@@ -1368,9 +2186,11 @@ def train_inbetween(
                 'lr_selector': lr_selector,
                 'selector_budget_weight': selector_budget_weight,
                 'selector_entropy_weight': selector_entropy_weight,
+                'selector_aux_weight': cfg.selector_aux_weight,
                 'selector_ratio': selector_ratio_avg,
                 'selector_budget': selector_budget_avg,
                 'selector_entropy': selector_entropy_avg,
+                'selector_aux': selector_aux_avg,
             })
 
         if step % 2_000 == 0:
@@ -1382,7 +2202,7 @@ def train_inbetween(
                 'inbetween': inbetween_model.state_dict(),
                 'inbetween_ema': ema_inbetween_state,
                 'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
-                'selector_ema': ema_selector_state if keyframe_selector is not None else None,
+                'selector_ema': ema_selector_state if selector_has_trainable_params else None,
                 'optimizer': inbetween_optimizer.state_dict(),
                 'step': step,
                 'best_step': best_step,
@@ -1396,7 +2216,7 @@ def train_inbetween(
         'inbetween': inbetween_model.state_dict(),
         'inbetween_ema': ema_inbetween_state,
         'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
-        'selector_ema': ema_selector_state if keyframe_selector is not None else None,
+        'selector_ema': ema_selector_state if selector_has_trainable_params else None,
         'optimizer': inbetween_optimizer.state_dict(),
         'step': cfg.inbetween_steps,
         'best_step': best_step,
@@ -1429,7 +2249,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpt-steps', type=int, default=None, help='Override GPT training steps')
     parser.add_argument('--inbetween-steps', type=int, default=None, help='Override in-betweening training steps')
     parser.add_argument('--inbetween-resume', type=str, default=None, help='Path to in-betweening checkpoint to resume/fine-tune from')
-    parser.add_argument('--inbetween-ckpt-prefix', type=str, default='composite_inbetween', help='Prefix for in-betweening checkpoint filenames')
+    parser.add_argument('--inbetween-ckpt-prefix', type=str, default=None, help='Prefix for in-betweening checkpoint filenames; defaults to selector-specific naming')
     parser.add_argument('--keyframe-source-dir', type=str, default=None, help='Directory of external conditioning motions (id.npy) used for keyframes')
     parser.add_argument('--disable-selector', action='store_true', help='Disable learned keyframe selector and use dataset keyframes directly')
     parser.add_argument('--lr', type=float, default=None, help='Override learning rate')
@@ -1440,6 +2260,11 @@ if __name__ == '__main__':
     parser.add_argument('--min-lr-ratio', type=float, default=None, help='Minimum LR ratio for cosine decay')
     parser.add_argument('--inbetween-lr', type=float, default=None, help='Override in-between model LR')
     parser.add_argument('--selector-lr', type=float, default=None, help='Override selector LR')
+    parser.add_argument('--selector-mode', choices=SELECTOR_MODE_CHOICES, default=None, help='Keyframe selector architecture')
+    parser.add_argument('--selector-oracle-ckpt', type=str, default=None, help='Frozen in-between checkpoint used to build information-gain oracle labels')
+    parser.add_argument('--selector-oracle-timesteps', type=int, default=None, help='Number of diffusion timesteps to average per oracle reconstruction score')
+    parser.add_argument('--selector-eval-root', type=str, default=None, help='T2M-GPT root used to load the retrieval evaluator for retrieval-gain labels')
+    parser.add_argument('--selector-retrieval-negatives', type=int, default=None, help='Number of negative captions sampled per oracle target for retrieval-gain')
     parser.add_argument('--ema-decay', type=float, default=None, help='EMA decay for in-between model/selector')
     parser.add_argument('--selector-curriculum-fraction', type=float, default=None, help='Fraction of total steps to ramp selector regularization')
     parser.add_argument('--val-interval', type=int, default=None, help='Validation interval for in-between training')
@@ -1464,6 +2289,11 @@ if __name__ == '__main__':
         min_lr_ratio=args.min_lr_ratio,
         inbetween_lr=args.inbetween_lr,
         selector_lr=args.selector_lr,
+        selector_mode=args.selector_mode,
+        selector_oracle_ckpt=args.selector_oracle_ckpt,
+        selector_oracle_timesteps=args.selector_oracle_timesteps,
+        selector_eval_root=args.selector_eval_root,
+        selector_retrieval_negatives=args.selector_retrieval_negatives,
         ema_decay=args.ema_decay,
         selector_curriculum_fraction=args.selector_curriculum_fraction,
         val_interval=args.val_interval,

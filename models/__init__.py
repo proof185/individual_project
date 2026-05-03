@@ -15,6 +15,7 @@ from .diffusion import (
     InbetweenDiffusion,
     InbetweenTransformer,
 )
+from .selectors import SELECTOR_MODE_CHOICES, KeyframeSelector, build_keyframe_selector
 
 __all__ = [
     'VectorQuantizer',
@@ -26,4 +27,7 @@ __all__ = [
     'timestep_embedding',
     'InbetweenDiffusion',
     'InbetweenTransformer',
+    'SELECTOR_MODE_CHOICES',
+    'KeyframeSelector',
+    'build_keyframe_selector',
 ]

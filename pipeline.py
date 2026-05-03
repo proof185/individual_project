@@ -10,6 +10,14 @@ import sys
 from typing import List
 
 
+SELECTOR_TRAIN_MODES = [
+    "text_alignment",
+    "saliency",
+    "information_gain",
+    "retrieval_gain",
+]
+
+
 def _project_root() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -24,6 +32,13 @@ def _run(script_name: str, script_args: List[str]) -> None:
     print("Running:")
     print(" ".join(cmd))
     subprocess.run(cmd, cwd=root, check=True)
+
+
+def _prefer_best_checkpoint(prefix: str, step: int) -> str:
+    root = _project_root()
+    best_ckpt = os.path.join(root, "checkpoints", f"{prefix}_best.pt")
+    step_ckpt = os.path.join(root, "checkpoints", f"{prefix}_step{int(step)}.pt")
+    return best_ckpt if os.path.exists(best_ckpt) else step_ckpt
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -134,6 +149,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     visualize = sub.add_parser("visualize", help="Visualize an existing motion .npy file")
     visualize.add_argument("motion_file", type=str)
+    visualize.add_argument("--normalized", action="store_true")
+    visualize.add_argument("--mean-path", type=str, default=None)
+    visualize.add_argument("--std-path", type=str, default=None)
+    visualize.add_argument("--no-center", action="store_true")
+    visualize.add_argument("--bounds-percentile", type=float, default=None)
+    visualize.add_argument("--interval-ms", type=int, default=None)
+    visualize.add_argument("--step-through", action="store_true")
+    visualize.add_argument("--save-mp4", type=str, default=None)
 
     # ---- Convenience single-stage train shortcuts ----
     train_vqvae = sub.add_parser("train-vqvae", help="Train only the VQ-VAE stage")
@@ -176,10 +199,36 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("evaluate", help="Run HumanML3D evaluation via eval_ML3D.py")
     evaluate.add_argument("--models", type=str, default="composite",
                           help="Models to evaluate: all, composite, gpt (comma-separated)")
+    evaluate.add_argument("--metrics", type=str, default="all",
+                          help="Metrics to compute: all or comma-separated fid,diversity,jerk,foot_skating,multimodality,multimodal_distance,matching_score,r_precision")
     evaluate.add_argument("--num-samples", type=int, default=256)
+    evaluate.add_argument("--batch-size", type=int, default=8)
+    evaluate.add_argument("--seed", type=int, default=1234)
+    evaluate.add_argument("--device", type=str, default=None)
+    evaluate.add_argument("--humanml-root", type=str, default="humanml")
+    evaluate.add_argument("--t2mgpt-root", type=str, default="D:/Projects/T2M-GPT")
+    evaluate.add_argument("--r-precision-top-k", type=str, default="1,2,3,5")
+    evaluate.add_argument("--multimodal-repeats", type=int, default=10)
+    evaluate.add_argument("--multimodal-sample-count", type=int, default=10)
+    evaluate.add_argument("--results-dir", type=str, default="samples/eval_results")
+    evaluate.add_argument("--results-path", type=str, default=None)
     evaluate.add_argument("--composite-gpt-steps", type=int, default=None)
     evaluate.add_argument("--composite-inbetween-steps", type=int, default=None)
+    evaluate.add_argument("--composite-inbetween-ckpt", type=str, default=None)
+    evaluate.add_argument("--arlm-vq-ckpt", type=str, default=None)
+    evaluate.add_argument("--arlm-gpt-ckpt", type=str, default=None)
+    evaluate.add_argument("--categorical-sample", action="store_true")
+    evaluate.add_argument("--ar-clamp-sigma", type=float, default=0.0)
+    evaluate.add_argument("--disable-selector", action="store_true")
+    evaluate.add_argument("--keyframe-strategy", type=str, choices=["interval", "random"], default=None)
+    evaluate.add_argument("--keyframe-interval", type=int, default=5)
+    evaluate.add_argument("--keyframe-count", type=int, default=None)
+    evaluate.add_argument("--keyframe-min", type=int, default=None)
+    evaluate.add_argument("--keyframe-max", type=int, default=None)
+    evaluate.add_argument("--no-keyframe-ends", action="store_true")
+    evaluate.add_argument("--diff-guidance", type=float, default=2.5)
     evaluate.add_argument("--load-results", action="store_true")
+    evaluate.add_argument("--save-results", action="store_true")
 
     retrain_finetune = sub.add_parser(
         "retrain-finetune",
@@ -201,6 +250,59 @@ def _build_parser() -> argparse.ArgumentParser:
     retrain_finetune.add_argument("--finetune-ckpt-prefix", type=str, default="finetuned_inbetween")
     retrain_finetune.add_argument("--overwrite-converted", action="store_true")
     retrain_finetune.add_argument("--disable-selector", action="store_true")
+
+    selector_stack = sub.add_parser(
+        "train-selectors-all",
+        help="Train shared diffusion base, then all selector variants, then ARLM adaptation",
+    )
+    selector_stack.add_argument("--project-root", type=str, default=".")
+    selector_stack.add_argument("--humanml-root", type=str, default="humanml")
+    selector_stack.add_argument("--t2mgpt-root", type=str, default="D:/Projects/T2M-GPT")
+    selector_stack.add_argument(
+        "--prepared-dir",
+        type=str,
+        default="humanml/arlm_train_pred_joint_vecs",
+        help="Prepared HumanML3D ARLM conditioning directory used for final adaptation",
+    )
+    selector_stack.add_argument(
+        "--selector-eval-root",
+        type=str,
+        default="D:/Projects/T2M-GPT",
+        help="T2M-GPT root used to build retrieval-gain oracle targets",
+    )
+    selector_stack.add_argument("--base-steps", type=int, default=5000)
+    selector_stack.add_argument("--selector-steps", type=int, default=5000)
+    selector_stack.add_argument("--arlm-finetune-steps", type=int, default=5000)
+    selector_stack.add_argument("--base-lr", type=float, default=1e-4)
+    selector_stack.add_argument("--selector-lr", type=float, default=1e-4)
+    selector_stack.add_argument("--arlm-lr", type=float, default=1e-5)
+    selector_stack.add_argument("--batch-size", type=int, default=32)
+    selector_stack.add_argument("--num-workers", type=int, default=0)
+    selector_stack.add_argument("--grad-accum-steps", type=int, default=4)
+    selector_stack.add_argument("--scheduler-type", choices=["cosine", "constant"], default=None)
+    selector_stack.add_argument("--warmup-ratio", type=float, default=None)
+    selector_stack.add_argument("--min-lr-ratio", type=float, default=None)
+    selector_stack.add_argument("--selector-oracle-timesteps", type=int, default=3)
+    selector_stack.add_argument("--selector-retrieval-negatives", type=int, default=31)
+    selector_stack.add_argument("--val-interval", type=int, default=None)
+    selector_stack.add_argument("--val-batches", type=int, default=None)
+    selector_stack.add_argument(
+        "--base-ckpt-prefix",
+        type=str,
+        default="composite_inbetween_base",
+        help="Checkpoint prefix for the shared no-selector base model",
+    )
+    selector_stack.add_argument(
+        "--skip-arlm-finetune",
+        action="store_true",
+        help="Stop after GT-conditioned selector training and skip ARLM adaptation",
+    )
+    selector_stack.add_argument(
+        "--selector-modes",
+        type=str,
+        default=",".join(SELECTOR_TRAIN_MODES),
+        help="Comma-separated selector modes to train",
+    )
 
     return parser
 
@@ -252,7 +354,24 @@ def main() -> None:
         return
 
     if args.command == "visualize":
-        _run("visualize.py", [args.motion_file])
+        script_args = [args.motion_file]
+        if args.normalized:
+            script_args.append("--normalized")
+        if args.mean_path is not None:
+            script_args.extend(["--mean-path", args.mean_path])
+        if args.std_path is not None:
+            script_args.extend(["--std-path", args.std_path])
+        if args.no_center:
+            script_args.append("--no-center")
+        if args.bounds_percentile is not None:
+            script_args.extend(["--bounds-percentile", str(args.bounds_percentile)])
+        if args.interval_ms is not None:
+            script_args.extend(["--interval-ms", str(args.interval_ms)])
+        if args.step_through:
+            script_args.append("--step-through")
+        if args.save_mp4 is not None:
+            script_args.extend(["--save-mp4", args.save_mp4])
+        _run("visualize.py", script_args)
         return
 
     if args.command == "train-vqvae":
@@ -329,6 +448,85 @@ def main() -> None:
         if args.disable_selector:
             finetune_args.append("--disable-selector")
         _run("finetune_inbetween_on_arlm_samples.py", finetune_args)
+        return
+
+    if args.command == "train-selectors-all":
+        selector_modes = [mode.strip().lower() for mode in args.selector_modes.split(",") if mode.strip()]
+        invalid_modes = [mode for mode in selector_modes if mode not in SELECTOR_TRAIN_MODES]
+        if invalid_modes:
+            raise ValueError(
+                f"Unknown selector modes {invalid_modes!r}. Expected subset of {SELECTOR_TRAIN_MODES}."
+            )
+        selector_modes = list(dict.fromkeys(selector_modes))
+
+        common_train_args = [
+            "--batch-size", str(int(args.batch_size)),
+            "--num-workers", str(int(args.num_workers)),
+            "--grad-accum-steps", str(int(args.grad_accum_steps)),
+        ]
+        if args.scheduler_type is not None:
+            common_train_args.extend(["--scheduler-type", args.scheduler_type])
+        if args.warmup_ratio is not None:
+            common_train_args.extend(["--warmup-ratio", str(float(args.warmup_ratio))])
+        if args.min_lr_ratio is not None:
+            common_train_args.extend(["--min-lr-ratio", str(float(args.min_lr_ratio))])
+        if args.val_interval is not None:
+            common_train_args.extend(["--val-interval", str(int(args.val_interval))])
+        if args.val_batches is not None:
+            common_train_args.extend(["--val-batches", str(int(args.val_batches))])
+
+        base_train_args = [
+            "--stage", "inbetween",
+            "--force",
+            "--disable-selector",
+            "--inbetween-steps", str(int(args.base_steps)),
+            "--inbetween-ckpt-prefix", args.base_ckpt_prefix,
+            "--lr", str(float(args.base_lr)),
+            *common_train_args,
+        ]
+        _run("train.py", base_train_args)
+
+        base_resume_ckpt = _prefer_best_checkpoint(args.base_ckpt_prefix, args.base_steps)
+        selector_target_step = int(args.base_steps + args.selector_steps)
+
+        for selector_mode in selector_modes:
+            selector_prefix = f"composite_inbetween_{selector_mode}"
+            selector_train_args = [
+                "--stage", "inbetween",
+                "--inbetween-resume", base_resume_ckpt,
+                "--inbetween-steps", str(selector_target_step),
+                "--inbetween-ckpt-prefix", selector_prefix,
+                "--selector-mode", selector_mode,
+                "--lr", str(float(args.selector_lr)),
+                "--selector-oracle-timesteps", str(int(args.selector_oracle_timesteps)),
+                *common_train_args,
+            ]
+            if selector_mode in {"information_gain", "retrieval_gain"}:
+                selector_train_args.extend(["--selector-oracle-ckpt", base_resume_ckpt])
+            if selector_mode == "retrieval_gain":
+                selector_train_args.extend([
+                    "--selector-eval-root", args.selector_eval_root,
+                    "--selector-retrieval-negatives", str(int(args.selector_retrieval_negatives)),
+                ])
+            _run("train.py", selector_train_args)
+
+            if args.skip_arlm_finetune:
+                continue
+
+            selector_resume_ckpt = _prefer_best_checkpoint(selector_prefix, selector_target_step)
+            arlm_prefix = f"{selector_prefix}_arlm"
+            arlm_finetune_args = [
+                "--project-root", args.project_root,
+                "--humanml-root", args.humanml_root,
+                "--prepared-dir", args.prepared_dir,
+                "--resume-ckpt", selector_resume_ckpt,
+                "--start-step", str(selector_target_step),
+                "--finetune-steps", str(int(args.arlm_finetune_steps)),
+                "--lr", str(float(args.arlm_lr)),
+                "--ckpt-prefix", arlm_prefix,
+                "--prepared-only",
+            ]
+            _run("finetune_inbetween_on_arlm_samples.py", arlm_finetune_args)
         return
 
     raise ValueError(f"Unknown command: {args.command}")

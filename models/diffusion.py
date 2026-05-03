@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from .selectors import KeyframeSelector
+
 
 def cosine_beta_schedule(T: int, s: float = 0.008) -> torch.Tensor:
     """Cosine beta schedule."""
@@ -311,86 +313,6 @@ class InbetweenDiffusion:
         )
         x = x * mask.float().unsqueeze(-1)
         return x
-
-
-class KeyframeSelector(nn.Module):
-    """Predict a binary frame mask for keyframe conditioning.
-
-    Uses a straight-through estimator so the forward pass is binary while
-    gradients flow through probabilities from the diffusion objective.
-    """
-
-    def __init__(
-        self,
-        feature_dim: int,
-        cond_dim: int = 512,
-        d_model: int = 256,
-        n_layers: int = 4,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-        max_len: int = 256,
-        threshold: float = 0.5,
-    ):
-        super().__init__()
-        self.threshold = threshold
-        self.frame_in = nn.Linear(feature_dim, d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, max_len, d_model))
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model),
-        )
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        self.out = nn.Linear(d_model, 1)
-        # Initialise output bias so sigmoid(bias) ≈ target_ratio (10%).
-        # sigmoid(-2.2) ≈ 0.10, preventing early all-ones collapse.
-        nn.init.constant_(self.out.bias, -2.2)
-        nn.init.normal_(self.pos_emb, std=0.02)
-
-    def forward(
-        self,
-        motion: torch.Tensor,
-        valid_mask: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, T, _ = motion.shape
-        if T > self.pos_emb.shape[1]:
-            raise ValueError(f"Sequence length {T} exceeds selector max_len {self.pos_emb.shape[1]}.")
-
-        h = self.frame_in(motion) + self.pos_emb[:, :T, :]
-        if cond is not None:
-            h = h + self.cond_mlp(cond).unsqueeze(1)
-
-        h = self.encoder(h, src_key_padding_mask=~valid_mask)
-        logits = self.out(h).squeeze(-1)
-        probs = torch.sigmoid(logits) * valid_mask.float()
-
-        hard = (probs > self.threshold).float()
-
-        # Always preserve start/end observations on each valid sequence.
-        endpoint_mask = torch.zeros_like(hard)
-        has_valid = valid_mask.any(dim=1)
-        if has_valid.any():
-            batch_idx = torch.arange(B, device=motion.device)[has_valid]
-            last_idx = valid_mask.long().sum(dim=1).clamp(min=1) - 1
-            endpoint_mask[batch_idx, 0] = 1.0
-            endpoint_mask[batch_idx, last_idx[batch_idx]] = 1.0
-
-        probs = torch.maximum(probs, endpoint_mask)
-        hard = torch.maximum(hard, endpoint_mask)
-
-        st_mask = hard + probs - probs.detach()
-        st_mask = st_mask * valid_mask.float()
-        return probs, st_mask
 
 
 class InbetweenTransformer(nn.Module):

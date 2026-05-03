@@ -9,16 +9,16 @@ class CompositeConfig:
     split: str = 'train'
     max_len: int = 196
     batch_size: int = 32
-    num_workers: int = 0
+    num_workers: int = 4
     pin_memory: bool = True
-    persistent_workers: bool = False
+    persistent_workers: bool = True
     prefetch_factor: int = 2
     keyframe_source_dir: str | None = None
 
     lr: float = 1e-4
     vqvae_steps: int = 100_000   # Stage 1a: VQ-VAE training (more steps for larger model)
     gpt_steps: int = 200_000     # Stage 1b: GPT training (more steps for larger model)
-    inbetween_steps: int = 200_000  # Stage 2: Diffusion in-betweening
+    inbetween_steps: int = 100_000  # Stage 2: Diffusion in-betweening
     grad_clip: float = 1.0
     grad_accum_steps: int = 4
 
@@ -52,6 +52,7 @@ class CompositeConfig:
     inbetween_velocity_weight: float = 0.75
     boundary_velocity_weight: float = 1.0
     boundary_acceleration_weight: float = 0.25
+    boundary_jerk_weight: float = 0.1
     transition_consistency_weight: float = 0.75
     transition_window: int = 4
     transition_sigma: float = 1.5
@@ -60,6 +61,7 @@ class CompositeConfig:
 
     # Learnable keyframe selector (upstream mask generator)
     use_learned_keyframe_selector: bool = True
+    selector_mode: str = 'text_alignment'
     selector_d_model: int = 256
     selector_layers: int = 4
     selector_heads: int = 4
@@ -68,7 +70,12 @@ class CompositeConfig:
     selector_target_ratio: float = 0.1
     selector_budget_weight: float = 5.0
     selector_entropy_weight: float = 0.02
+    selector_aux_weight: float = 0.5
     selector_curriculum_fraction: float = 0.0
+    selector_oracle_ckpt_path: str | None = None
+    selector_oracle_timesteps: int = 3
+    selector_eval_root: str | None = None
+    selector_retrieval_negatives: int = 31
 
     # VQ-VAE
     codebook_size: int = 512   # Larger codebook for richer motion vocabulary

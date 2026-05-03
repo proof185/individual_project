@@ -159,6 +159,51 @@ def boundary_acceleration_loss(
     return masked_mse(accel_gt, accel_pr, accel_mask)
 
 
+def boundary_jerk_loss(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    mask: torch.Tensor,
+    keyframe_indices: torch.Tensor,
+    keyframe_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match jerk only on four-frame stencils immediately surrounding keyframes."""
+    B, T, _ = x.shape
+    jerk_len = max(T - 3, 0)
+    if jerk_len == 0:
+        return x.new_tensor(0.0)
+
+    idx = keyframe_indices.long()
+    valid_k = keyframe_mask.bool()
+    mask_long = mask.long()
+
+    idx_m2 = (idx - 2).clamp(0, T - 1)
+    idx_m1 = (idx - 1).clamp(0, T - 1)
+    idx_clamp = idx.clamp(0, T - 1)
+    idx_p1 = (idx + 1).clamp(0, T - 1)
+    idx_p2 = (idx + 2).clamp(0, T - 1)
+
+    at_m2 = torch.gather(mask_long, 1, idx_m2).bool()
+    at_m1 = torch.gather(mask_long, 1, idx_m1).bool()
+    at_kf = torch.gather(mask_long, 1, idx_clamp).bool()
+    at_p1 = torch.gather(mask_long, 1, idx_p1).bool()
+    at_p2 = torch.gather(mask_long, 1, idx_p2).bool()
+
+    left_valid = valid_k & (idx > 1) & (idx < T - 1) & at_m2 & at_m1 & at_kf & at_p1
+    left_pos = (idx - 2).clamp(0, jerk_len - 1)
+
+    right_valid = valid_k & (idx > 0) & (idx < T - 2) & at_m1 & at_kf & at_p1 & at_p2
+    right_pos = (idx - 1).clamp(0, jerk_len - 1)
+
+    jerk_float = x.new_zeros(B, jerk_len)
+    jerk_float.scatter_add_(1, left_pos, left_valid.float())
+    jerk_float.scatter_add_(1, right_pos, right_valid.float())
+    jerk_mask = jerk_float > 0.0
+
+    jerk_gt = x[:, 3:] - 3 * x[:, 2:-1] + 3 * x[:, 1:-2] - x[:, :-3]
+    jerk_pr = x_hat[:, 3:] - 3 * x_hat[:, 2:-1] + 3 * x_hat[:, 1:-2] - x_hat[:, :-3]
+    return masked_mse(jerk_gt, jerk_pr, jerk_mask)
+
+
 def transition_consistency_loss(
     x: torch.Tensor,
     x_hat: torch.Tensor,

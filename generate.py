@@ -11,7 +11,8 @@ import torch
 from config import CompositeConfig
 from models.vqvae import MotionVQVAE
 from models.gpt import MotionGPT
-from models.diffusion import InbetweenDiffusion, InbetweenTransformer, KeyframeSelector
+from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+from models.selectors import build_keyframe_selector
 from utils import setup_clip_model, encode_text, encode_text_with_tokens
 
 
@@ -144,23 +145,40 @@ def load_models(
         inbetween_state_for_infer = inbetween_ckpt.get('inbetween_ema', inbetween_ckpt['inbetween'])
         inbetween_model.load_state_dict(inbetween_state_for_infer)
         selector_state = inbetween_ckpt.get('selector_ema', inbetween_ckpt.get('selector'))
+        saved_cfg = inbetween_ckpt.get('cfg') if isinstance(inbetween_ckpt, dict) else None
+        saved_selector_mode = cfg.selector_mode
+        saved_selector_heads = cfg.selector_heads
+        saved_selector_threshold = cfg.selector_threshold
+        saved_selector_ratio = cfg.selector_target_ratio
+        if isinstance(saved_cfg, dict):
+            saved_selector_mode = str(saved_cfg.get('selector_mode', saved_selector_mode))
+            saved_selector_heads = int(saved_cfg.get('selector_heads', saved_selector_heads))
+            saved_selector_threshold = float(saved_cfg.get('selector_threshold', saved_selector_threshold))
+            saved_selector_ratio = float(saved_cfg.get('selector_target_ratio', saved_selector_ratio))
         if cfg.use_learned_keyframe_selector and selector_state is not None:
-            selector_d_model = int(selector_state['frame_in.weight'].shape[0])
-            selector_layers = _count_prefix_layers(selector_state, 'encoder.layers.', 2) or cfg.selector_layers
-            selector_model = KeyframeSelector(
+            selector_d_model = cfg.selector_d_model
+            if isinstance(selector_state, dict) and 'frame_in.weight' in selector_state:
+                selector_d_model = int(selector_state['frame_in.weight'].shape[0])
+            selector_layers = cfg.selector_layers
+            if isinstance(selector_state, dict):
+                selector_layers = _count_prefix_layers(selector_state, 'encoder.layers.', 2) or selector_layers
+            selector_model = build_keyframe_selector(
+                mode=saved_selector_mode,
                 feature_dim=Fdim,
                 cond_dim=512,
                 d_model=selector_d_model,
                 n_layers=selector_layers,
-                n_heads=cfg.selector_heads,
+                n_heads=saved_selector_heads,
                 dropout=cfg.selector_dropout,
                 max_len=cfg.max_len + 10,
-                threshold=cfg.selector_threshold,
+                threshold=saved_selector_threshold,
+                budget_ratio=saved_selector_ratio,
             ).to(device)
-            selector_model.load_state_dict(selector_state)
+            if isinstance(selector_state, dict) and len(selector_state) > 0:
+                selector_model.load_state_dict(selector_state, strict=False)
             selector_model.eval()
             inbetween_model.keyframe_selector = selector_model
-            print('Loaded learned keyframe selector from in-betweening checkpoint (EMA if available)')
+            print(f'Loaded {saved_selector_mode} keyframe selector from in-betweening checkpoint (EMA if available)')
         print(f"Loaded in-betweening model from {inbetween_ckpt_path} (EMA if available)")
     
     # Set to eval mode
@@ -342,7 +360,7 @@ def generate_composite(
         keyframe_indices = torch.tensor(keyframe_indices, dtype=torch.long, device=device)
     
     keyframes = ar_motion_norm[keyframe_indices]  # (K, F)
-    print(f"Extracted {len(keyframe_indices)} keyframes at positions: {keyframe_indices.tolist()[:10]}...")
+    print(f"Extracted {len(keyframe_indices)} keyframes at positions: {keyframe_indices.tolist()}")
     
     # ========== Stage 2: Diffusion In-Betweening ==========
     print("\nStage 2: Filling in-between frames with diffusion...")
