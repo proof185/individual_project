@@ -11,22 +11,13 @@ import types
 from contextlib import contextmanager
 from datetime import datetime
 from itertools import cycle
-
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-try:
-    import matplotlib.pyplot as plt
-except Exception:
-    plt = None
-
-from config import CompositeConfig
+import matplotlib.pyplot as plt
+from config import InbetweenTrainConfig
 from dataset import HUMANML3DCompositeDataset, collate_composite
-from models.vqvae import MotionVQVAE
-from models.gpt import MotionGPT
 from models.diffusion import InbetweenDiffusion, InbetweenTransformer
 from models.selectors import SELECTOR_MODE_CHOICES, build_keyframe_selector
 from utils import (
@@ -34,12 +25,9 @@ from utils import (
     encode_text,
     encode_text_with_tokens,
     masked_mse,
-    prepare_gpt_batch,
     setup_clip_model,
-    vel_loss,
     weighted_masked_mse,
 )
-
 
 class TextEncoderWrapper:
     """Wrapper for text encoder that can be pickled for multiprocessing."""
@@ -230,7 +218,7 @@ def _load_oracle_inbetween_model(
     feature_dim: int,
     device: torch.device,
 ):
-    oracle_cfg = CompositeConfig()
+    oracle_cfg = InbetweenTrainConfig()
     _apply_inbetween_arch_from_checkpoint(oracle_cfg, oracle_ckpt_path, device)
     oracle_model = InbetweenTransformer(
         feature_dim=feature_dim,
@@ -1122,109 +1110,39 @@ def _evaluate_inbetween(
 
 
 def main(
-    stage: str,
     force_retrain: bool,
-    vqvae_steps: int | None = None,
-    gpt_steps: int | None = None,
-    inbetween_steps: int | None = None,
     inbetween_resume: str | None = None,
-    keyframe_source_dir: str | None = None,
-    disable_selector: bool = False,
-    lr: float | None = None,
     inbetween_ckpt_prefix: str | None = None,
-    batch_size: int | None = None,
-    num_workers: int | None = None,
-    scheduler_type: str | None = None,
-    warmup_ratio: float | None = None,
-    min_lr_ratio: float | None = None,
-    inbetween_lr: float | None = None,
-    selector_lr: float | None = None,
-    selector_mode: str | None = None,
-    selector_oracle_ckpt: str | None = None,
-    selector_oracle_timesteps: int | None = None,
-    selector_eval_root: str | None = None,
-    selector_retrieval_negatives: int | None = None,
-    ema_decay: float | None = None,
-    selector_curriculum_fraction: float | None = None,
-    val_interval: int | None = None,
-    val_batches: int | None = None,
-    grad_accum_steps: int | None = None,
 ):
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('device:', device)
     
-    cfg = CompositeConfig(
-        keyframe_strategy='random',      # Switch to random
-        keyframe_min=3,                  # Min keyframes per sequence
-        keyframe_max=20,                 # Max keyframes per sequence
-        keyframe_include_ends=True,      # Always include first/last frame
-        # ... other params
-    )
-    if vqvae_steps is not None:
-        cfg.vqvae_steps = int(vqvae_steps)
-    if gpt_steps is not None:
-        cfg.gpt_steps = int(gpt_steps)
-    if inbetween_steps is not None:
-        cfg.inbetween_steps = int(inbetween_steps)
+    cfg = InbetweenTrainConfig()
+    
     if inbetween_resume is not None:
         inbetween_resume = inbetween_resume.strip()
-    if keyframe_source_dir is not None:
-        cfg.keyframe_source_dir = keyframe_source_dir
-    if disable_selector:
-        cfg.use_learned_keyframe_selector = False
-    if lr is not None:
-        cfg.lr = float(lr)
-    if batch_size is not None:
-        cfg.batch_size = int(batch_size)
-    if num_workers is not None:
-        cfg.num_workers = int(num_workers)
-    if scheduler_type is not None:
-        cfg.scheduler_type = scheduler_type
-    if warmup_ratio is not None:
-        cfg.warmup_ratio = float(warmup_ratio)
-    if min_lr_ratio is not None:
-        cfg.min_lr_ratio = float(min_lr_ratio)
-    if inbetween_lr is not None:
-        cfg.inbetween_lr = float(inbetween_lr)
-    if selector_lr is not None:
-        cfg.selector_lr = float(selector_lr)
-    if selector_mode is not None:
-        cfg.selector_mode = selector_mode.strip().lower()
-        if cfg.selector_mode not in SELECTOR_MODE_CHOICES:
-            raise ValueError(f"Unknown selector mode {cfg.selector_mode!r}. Expected one of {SELECTOR_MODE_CHOICES}.")
-    if selector_oracle_ckpt is not None:
-        cfg.selector_oracle_ckpt_path = selector_oracle_ckpt.strip()
-    if selector_oracle_timesteps is not None:
-        cfg.selector_oracle_timesteps = max(1, int(selector_oracle_timesteps))
-    if selector_eval_root is not None:
-        cfg.selector_eval_root = selector_eval_root.strip()
-    if selector_retrieval_negatives is not None:
-        cfg.selector_retrieval_negatives = max(1, int(selector_retrieval_negatives))
-    if ema_decay is not None:
-        cfg.ema_decay = float(ema_decay)
-    if selector_curriculum_fraction is not None:
-        cfg.selector_curriculum_fraction = float(selector_curriculum_fraction)
-    if val_interval is not None:
-        cfg.val_interval = int(val_interval)
-    if val_batches is not None:
-        cfg.val_batches = int(val_batches)
-    if grad_accum_steps is not None:
-        cfg.grad_accum_steps = max(1, int(grad_accum_steps))
+    
+    cfg.selector_mode = str(cfg.selector_mode).strip().lower()
+    
+    if cfg.selector_mode not in SELECTOR_MODE_CHOICES:
+        raise ValueError(f"Unknown selector mode {cfg.selector_mode!r}. Expected one of {SELECTOR_MODE_CHOICES}.")
+    
     if inbetween_ckpt_prefix is None or not inbetween_ckpt_prefix.strip():
         inbetween_ckpt_prefix = _default_inbetween_ckpt_prefix(cfg)
+    
     inbetween_ckpt_prefix = inbetween_ckpt_prefix.strip()
-    if stage in {'all', 'inbetween'}:
-        selector_state = 'enabled' if cfg.use_learned_keyframe_selector else 'disabled'
-        print(
-            f"Keyframe strategy (dataset fallback): {cfg.keyframe_strategy} | "
-            f"selector: {selector_state} ({cfg.selector_mode})"
-        )
-    else:
-        print(f"Keyframe strategy: {cfg.keyframe_strategy}")
+    
+    selector_state = 'enabled' if cfg.use_learned_keyframe_selector else 'disabled'
+    print(
+        f"Keyframe strategy (dataset fallback): {cfg.keyframe_strategy} | "
+        f"selector: {selector_state} ({cfg.selector_mode})"
+    )
 
     inbetween_final_ckpt_path = f'checkpoints/{inbetween_ckpt_prefix}_step{cfg.inbetween_steps}.pt'
-    if stage in {'all', 'inbetween'} and not force_retrain:
+    
+    # Load in-between architecture from checkpoint if available
+    if not force_retrain:
         arch_ckpt_path = None
         if inbetween_resume is not None and os.path.exists(inbetween_resume):
             arch_ckpt_path = inbetween_resume
@@ -1245,9 +1163,12 @@ def main(
     # Load normalization statistics
     mean_path = os.path.join(cfg.root, 'Mean.npy')
     std_path = os.path.join(cfg.root, 'Std.npy')
+    
     mean = torch.from_numpy(np.load(mean_path)).float().view(-1)
     std = torch.from_numpy(np.load(std_path)).float().view(-1)
+    
     Fdim = mean.shape[0]
+    
     print('Feature dim:', Fdim)
     
     # Setup CLIP
@@ -1255,10 +1176,9 @@ def main(
     
     text_encoder = TextEncoderWrapper(clip_model)
     
-    empty_emb, empty_token_features, empty_token_mask = text_encoder.encode_with_tokens([''])
+    empty_emb, _, _ = text_encoder.encode_with_tokens([''])
     empty_emb = empty_emb.squeeze(0)
-    empty_token_features = empty_token_features.squeeze(0)
-    empty_token_mask = empty_token_mask.squeeze(0)
+    
     print('Empty embedding norm:', empty_emb.norm().item())
     
     # Create dataset
@@ -1275,56 +1195,56 @@ def main(
         keyframe_min=cfg.keyframe_min,
         keyframe_max=cfg.keyframe_max,
         keyframe_include_ends=cfg.keyframe_include_ends,
-        include_keyframes=(stage != 'gpt'),
+        include_keyframes=True,
         conditioning_motion_dir=cfg.keyframe_source_dir,
         mean=mean,
         std=std,
         device=device,
     )
+    
     print('Dataset size:', len(dataset))
 
     val_dataset = None
     val_loader = None
-    if stage in {'all', 'inbetween'}:
-        val_split_file = os.path.join(cfg.root, f'{cfg.val_split}.txt')
-        if os.path.exists(val_split_file):
-            val_dataset = HUMANML3DCompositeDataset(
-                cfg.root,
-                split=cfg.val_split,
-                max_len=cfg.max_len,
-                normalize=True,
-                use_cache=True,
-                text_encoder=text_encoder,
-                keyframe_interval=cfg.keyframe_interval,
-                keyframe_strategy=cfg.keyframe_strategy,
-                keyframe_count=cfg.keyframe_count,
-                keyframe_min=cfg.keyframe_min,
-                keyframe_max=cfg.keyframe_max,
-                keyframe_include_ends=cfg.keyframe_include_ends,
-                conditioning_motion_dir=cfg.keyframe_source_dir,
-                mean=mean,
-                std=std,
-                device=device,
-            )
-            val_loader_kwargs = {
-                'batch_size': min(cfg.val_batch_size, cfg.batch_size),
-                'shuffle': False,
-                'num_workers': cfg.num_workers,
-                'collate_fn': collate_composite,
-                'drop_last': False,
-                'pin_memory': bool(cfg.pin_memory and device.type == 'cuda'),
-            }
-            if cfg.num_workers > 0:
-                val_loader_kwargs['persistent_workers'] = cfg.persistent_workers
-                val_loader_kwargs['prefetch_factor'] = cfg.prefetch_factor
-            val_loader = DataLoader(val_dataset, **val_loader_kwargs)
-            print(f"Validation dataset size: {len(val_dataset)} ({cfg.val_split})")
-        else:
-            print(f"Validation split file not found: {val_split_file}; best-checkpoint selection disabled.")
+    val_split_file = os.path.join(cfg.root, f'{cfg.val_split}.txt')
+    if os.path.exists(val_split_file):
+        val_dataset = HUMANML3DCompositeDataset(
+            cfg.root,
+            split=cfg.val_split,
+            max_len=cfg.max_len,
+            normalize=True,
+            use_cache=True,
+            text_encoder=text_encoder,
+            keyframe_interval=cfg.keyframe_interval,
+            keyframe_strategy=cfg.keyframe_strategy,
+            keyframe_count=cfg.keyframe_count,
+            keyframe_min=cfg.keyframe_min,
+            keyframe_max=cfg.keyframe_max,
+            keyframe_include_ends=cfg.keyframe_include_ends,
+            conditioning_motion_dir=cfg.keyframe_source_dir,
+            mean=mean,
+            std=std,
+            device=device,
+        )
+        val_loader_kwargs = {
+            'batch_size': min(cfg.val_batch_size, cfg.batch_size),
+            'shuffle': False,
+            'num_workers': cfg.num_workers,
+            'collate_fn': collate_composite,
+            'drop_last': False,
+            'pin_memory': bool(cfg.pin_memory and device.type == 'cuda'),
+        }
+        if cfg.num_workers > 0:
+            val_loader_kwargs['persistent_workers'] = cfg.persistent_workers
+            val_loader_kwargs['prefetch_factor'] = cfg.prefetch_factor
+        val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+        print(f"Validation dataset size: {len(val_dataset)} ({cfg.val_split})")
+    else:
+        print(f"Validation split file not found: {val_split_file}; best-checkpoint selection disabled.")
 
     selector_oracle_targets = None
     val_selector_oracle_targets = None
-    if stage in {'all', 'inbetween'} and cfg.use_learned_keyframe_selector and _selector_mode_uses_oracle_targets(cfg.selector_mode):
+    if cfg.use_learned_keyframe_selector and _selector_mode_uses_oracle_targets(cfg.selector_mode):
         oracle_ckpt_path = cfg.selector_oracle_ckpt_path or _default_selector_oracle_ckpt_path()
         if not oracle_ckpt_path:
             raise FileNotFoundError(
@@ -1358,34 +1278,7 @@ def main(
         f"persistent_workers={loader_kwargs.get('persistent_workers', False)}",
         f"prefetch_factor={loader_kwargs.get('prefetch_factor', 'n/a')}"
     )
-    
-    # Initialize only models needed for selected stage(s).
-    vqvae = None
-    gpt = None
-    if stage in {'all', 'vqvae', 'gpt'}:
-        vqvae = MotionVQVAE(
-            feature_dim=Fdim,
-            codebook_size=cfg.codebook_size,
-            codebook_dim=cfg.codebook_dim,
-            downsample_rate=cfg.downsample_rate,
-            commitment_cost=cfg.commitment_cost,
-        ).to(device)
-        print(f'VQ-VAE params: {sum(p.numel() for p in vqvae.parameters())/1e6:.2f}M')
 
-    if stage in {'all', 'gpt'}:
-        gpt = MotionGPT(
-            codebook_size=cfg.codebook_size,
-            d_model=cfg.d_model,
-            n_layers=cfg.n_layers,
-            n_heads=cfg.n_heads,
-            dropout=cfg.dropout,
-            max_len=cfg.max_len // cfg.downsample_rate + 10,
-            cond_dim=512,
-        ).to(device)
-        print(f'MotionGPT params: {sum(p.numel() for p in gpt.parameters())/1e6:.2f}M')
-    elif stage == 'inbetween':
-        print('Skipping VQ-VAE and MotionGPT initialization (stage=inbetween).')
-    
     inbetween_model = InbetweenTransformer(
         feature_dim=Fdim,
         cond_dim=512,
@@ -1417,435 +1310,27 @@ def main(
         )
     
     diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
-    
-    # Stage 1a: Train VQ-VAE
-    if stage in {'all', 'vqvae'}:
-        if vqvae is None:
-            raise RuntimeError('VQ-VAE model is not initialized for requested stage.')
-        train_vqvae(vqvae, loader, cfg, device, mean, std, force_retrain)
-    
-    # Stage 1b: Train GPT
-    if stage in {'all', 'gpt'}:
-        
-        if vqvae is None or gpt is None:
-            raise RuntimeError('VQ-VAE/GPT models are not initialized for requested stage.')
-        
-        vqvae_ckpt_path = f'checkpoints/composite_vqvae_step{cfg.vqvae_steps}.pt'
-        if not os.path.exists(vqvae_ckpt_path):
-            raise FileNotFoundError(f"Missing VQ-VAE checkpoint: {vqvae_ckpt_path}")
 
-        print(f"Loading trained VQ-VAE for GPT tokenisation: {vqvae_ckpt_path}")
-        vqvae_ckpt = torch.load(vqvae_ckpt_path, map_location=device)
-        vqvae.load_state_dict(vqvae_ckpt['model'])
-        vqvae.eval()
-        
-        train_gpt(
-            vqvae,
-            gpt,
-            loader,
-            dataset,
-            empty_token_features,
-            empty_token_mask,
-            cfg,
-            device,
-            force_retrain,
-        )
-    
-    # Stage 2: Train Diffusion In-betweening
-    if stage in {'all', 'inbetween'}:
-        train_inbetween(
-            inbetween_model,
-            diff_inbetween,
-            loader,
-            val_loader,
-            dataset,
-            empty_emb,
-            cfg,
-            device,
-            mean,
-            std,
-            force_retrain,
-            keyframe_selector=keyframe_selector,
-            resume_ckpt_path=inbetween_resume,
-            ckpt_prefix=inbetween_ckpt_prefix,
-            selector_oracle_targets=selector_oracle_targets,
-            val_selector_oracle_targets=val_selector_oracle_targets,
-        )
+    train_inbetween(
+        inbetween_model,
+        diff_inbetween,
+        loader,
+        val_loader,
+        dataset,
+        empty_emb,
+        cfg,
+        device,
+        mean,
+        std,
+        force_retrain,
+        keyframe_selector=keyframe_selector,
+        resume_ckpt_path=inbetween_resume,
+        ckpt_prefix=inbetween_ckpt_prefix,
+        selector_oracle_targets=selector_oracle_targets,
+        val_selector_oracle_targets=val_selector_oracle_targets,
+    )
     
     print("Training complete!")
-
-
-def train_vqvae(vqvae, loader, cfg, device, mean, std, force_retrain: bool = False):
-    """Stage 1a: Train VQ-VAE."""
-    vqvae_final_ckpt_path = f'checkpoints/composite_vqvae_step{cfg.vqvae_steps}.pt'
-    if os.path.exists(vqvae_final_ckpt_path) and not force_retrain:
-        print(f"Loading VQ-VAE from final checkpoint: {vqvae_final_ckpt_path}")
-        vqvae_ckpt = torch.load(vqvae_final_ckpt_path, map_location=device)
-        vqvae.load_state_dict(vqvae_ckpt['model'])
-        print("VQ-VAE training already complete! Loaded from checkpoint.")
-        return
-    
-    vqvae_optimizer = torch.optim.AdamW(vqvae.parameters(), lr=cfg.lr)
-    base_lrs = [cfg.lr]
-    lambda_recon = 1.0
-    lambda_vel = 0.5
-    metrics_logger = _init_metrics_logger(
-        'vqvae',
-        ['step', 'recon_loss', 'vq_loss', 'vel_loss', 'total_loss']
-    )
-    print(f"VQ-VAE metrics CSV: {metrics_logger['csv_path']}")
-    
-    vqvae.train()
-    data_iter = cycle(loader)
-    grad_accum_steps = max(1, int(cfg.grad_accum_steps))
-    
-    print("Stage 1a: Training VQ-VAE...")
-    start_time = time.time()
-    
-    for step in range(1, cfg.vqvae_steps + 1):
-        _apply_lr_schedule(
-            vqvae_optimizer,
-            base_lrs,
-            step,
-            cfg.vqvae_steps,
-            cfg.warmup_ratio,
-            cfg.min_lr_ratio,
-            cfg.scheduler_type,
-        )
-        vqvae_optimizer.zero_grad(set_to_none=True)
-        recon_running = 0.0
-        vq_running = 0.0
-        vel_running = 0.0
-        total_running = 0.0
-
-        for _ in range(grad_accum_steps):
-            batch = next(data_iter)
-            x = batch['motion'].to(device)
-            mask = batch['mask'].to(device)
-
-            B, T, _ = x.shape
-            pad_len = (cfg.downsample_rate - T % cfg.downsample_rate) % cfg.downsample_rate
-            if pad_len > 0:
-                x = F.pad(x, (0, 0, 0, pad_len))
-                mask = F.pad(mask, (0, pad_len), value=False)
-
-            x_recon, indices, vq_loss = vqvae(x, mask)
-
-            x_recon = x_recon[:, :T]
-            mask_orig = batch['mask'].to(device)
-
-            recon_loss = masked_mse(batch['motion'].to(device), x_recon, mask_orig)
-            v_loss = vel_loss(batch['motion'].to(device), x_recon, mask_orig)
-
-            loss = lambda_recon * recon_loss + vq_loss + lambda_vel * v_loss
-            (loss / grad_accum_steps).backward()
-
-            recon_running += recon_loss.item()
-            vq_running += vq_loss.item()
-            vel_running += v_loss.item()
-            total_running += loss.item()
-
-        nn.utils.clip_grad_norm_(vqvae.parameters(), cfg.grad_clip)
-        vqvae_optimizer.step()
-
-        recon_avg = recon_running / grad_accum_steps
-        vq_avg = vq_running / grad_accum_steps
-        vel_avg = vel_running / grad_accum_steps
-        total_avg = total_running / grad_accum_steps
-        
-        if step % 200 == 0:
-            current_time = time.time()
-            elapsed = current_time - start_time
-            steps_done = step
-            steps_remaining = cfg.vqvae_steps - step
-            avg_time_per_step = elapsed / steps_done
-            eta_seconds = steps_remaining * avg_time_per_step
-            eta_hours = int(eta_seconds // 3600)
-            eta_minutes = int((eta_seconds % 3600) // 60)
-            lr_now = vqvae_optimizer.param_groups[0]['lr']
-            print(f"step {step:>7d} | recon {recon_avg:.5f} | vq {vq_avg:.5f} | vel {vel_avg:.5f} | lr {lr_now:.2e} | ETA: {eta_hours}h {eta_minutes}m")
-            _append_metrics_row(metrics_logger, {
-                'step': step,
-                'recon_loss': recon_avg,
-                'vq_loss': vq_avg,
-                'vel_loss': vel_avg,
-                'total_loss': total_avg,
-            })
-
-        if step % 2_000 == 0:
-            _save_convergence_plot(metrics_logger)
-        
-        if step % 10_000 == 0:
-            os.makedirs('checkpoints', exist_ok=True)
-            torch.save({
-                'model': vqvae.state_dict(),
-                'optimizer': vqvae_optimizer.state_dict(),
-                'step': step,
-            }, f'checkpoints/composite_vqvae_step{step}.pt')
-            print('Saved VQ-VAE checkpoint')
-
-    os.makedirs('checkpoints', exist_ok=True)
-    torch.save({
-        'model': vqvae.state_dict(),
-        'optimizer': vqvae_optimizer.state_dict(),
-        'step': cfg.vqvae_steps,
-    }, vqvae_final_ckpt_path)
-    print(f'Saved final VQ-VAE checkpoint: {vqvae_final_ckpt_path}')
-    _save_convergence_plot(metrics_logger)
-    print(f"VQ-VAE convergence plot: {metrics_logger['plot_path']}")
-    
-    print("VQ-VAE training complete!")
-
-
-# ---------------------------------------------------------------------------
-# GPT pre-tokenization helpers
-# ---------------------------------------------------------------------------
-
-def _pretokenize_dataset(vqvae, dataset, cfg, device):
-    """Run VQ-VAE encode over every dataset motion once and cache the tokens.
-
-    VQ tokens are deterministic (argmax), so running the encoder on every GPT
-    training step is pure overhead.  This function computes the tokens once,
-    saves them to disk, and returns a dict ``{sample_id: (tokens_cpu, token_len)}``.
-    """
-    cache_path = os.path.join(
-        cfg.root,
-        f'gpt_tokens_cb{cfg.codebook_size}_ds{cfg.downsample_rate}_maxlen{cfg.max_len}.pt',
-    )
-    if os.path.exists(cache_path):
-        print(f'Loading pre-tokenised GPT data from {cache_path}')
-        return torch.load(cache_path, map_location='cpu')
-
-    print('Pre-tokenising dataset with VQ-VAE (one-time cost, result cached)...')
-    vqvae.eval()
-    tokens_dict = {}
-    n = len(dataset.data)
-    with torch.no_grad():
-        for i, item in enumerate(dataset.data):
-            mid = item['id']
-            motion = item['motion']          # (T, F) normalised CPU tensor
-            actual_length = int(item['length'])
-            T = motion.shape[0]
-
-            x = motion.unsqueeze(0).to(device)
-            pad_len = (cfg.downsample_rate - T % cfg.downsample_rate) % cfg.downsample_rate
-            if pad_len > 0:
-                x = F.pad(x, (0, 0, 0, pad_len))
-
-            indices, _ = vqvae.encode(x)          # (1, T_tokens)
-            tok_len = min(
-                (actual_length + cfg.downsample_rate - 1) // cfg.downsample_rate,
-                indices.shape[1],
-            )
-            tokens_dict[mid] = (indices[0].cpu(), tok_len)
-
-            if (i + 1) % 1000 == 0 or (i + 1) == n:
-                print(f'  tokenised {i + 1}/{n} sequences')
-
-    torch.save(tokens_dict, cache_path)
-    print(f'Saved token cache: {cache_path}')
-    return tokens_dict
-
-
-def _build_gpt_batch_from_tokens(batch, tokens_dict, gpt, device):
-    """Build GPT input/target/mask tensors from pre-tokenised data.
-
-    Replaces ``prepare_gpt_batch`` in the hot loop, eliminating the per-step
-    VQ-VAE encode.
-    """
-    ids = batch['ids']
-    B = len(ids)
-
-    token_seqs = []
-    token_lengths = []
-    for mid in ids:
-        tokens, tok_len = tokens_dict[mid]
-        token_seqs.append(tokens[:tok_len])
-        token_lengths.append(tok_len)
-
-    T_max = max(token_lengths)
-
-    input_tokens = torch.full(
-        (B, T_max + 1),
-        gpt.pad_token,
-        dtype=torch.long,
-        device=device,
-    )
-    target_tokens = torch.full(
-        (B, T_max + 1),
-        gpt.pad_token,
-        dtype=torch.long,
-        device=device,
-    )
-    target_mask = torch.zeros(
-        B,
-        T_max + 1,
-        dtype=torch.bool,
-        device=device,
-    )
-
-    for i, (seq, tlen) in enumerate(zip(token_seqs, token_lengths)):
-        seq = seq[:tlen].to(device, non_blocking=True)
-
-        input_tokens[i, 0] = gpt.bos_token
-        input_tokens[i, 1:tlen + 1] = seq
-
-        target_tokens[i, :tlen] = seq
-        target_tokens[i, tlen] = gpt.eos_token
-
-        target_mask[i, :tlen + 1] = True
-
-    return input_tokens, target_tokens, target_mask
-
-
-def _build_gpt_cond_batch(batch, dataset, empty_tokens, empty_mask, p_uncond: float, device):
-    cond_list = []
-    mask_list = []
-    for mid, tidx in zip(batch['ids'], batch['text_idxs']):
-        if random.random() < p_uncond:
-            cond_list.append(empty_tokens)
-            mask_list.append(empty_mask)
-        else:
-            cond_list.append(dataset.get_token_embedding(mid, tidx))
-            mask_list.append(dataset.get_token_mask(mid, tidx))
-
-    max_ctx = max(int(mask.shape[0]) for mask in mask_list)
-    feat_dim = int(cond_list[0].shape[-1])
-    cond = torch.zeros(len(cond_list), max_ctx, feat_dim, dtype=cond_list[0].dtype, device=device)
-    cond_mask = torch.zeros(len(cond_list), max_ctx, dtype=torch.bool, device=device)
-
-    for i, (feat, mask) in enumerate(zip(cond_list, mask_list)):
-        ctx_len = int(mask.shape[0])
-        cond[i, :ctx_len] = feat.to(device, non_blocking=True)
-        cond_mask[i, :ctx_len] = mask.to(device, non_blocking=True)
-
-    return cond, cond_mask
-
-
-def train_gpt(vqvae, gpt, loader, dataset, empty_cond_tokens, empty_cond_mask, cfg, device, force_retrain: bool = False):
-    """Stage 1b: Train MotionGPT."""
-    gpt_final_ckpt_path = f'checkpoints/composite_gpt_step{cfg.gpt_steps}.pt'
-    if os.path.exists(gpt_final_ckpt_path) and not force_retrain:
-        print(f"Loading GPT from final checkpoint: {gpt_final_ckpt_path}")
-        gpt_ckpt = torch.load(gpt_final_ckpt_path, map_location=device)
-        try:
-            gpt.load_state_dict(gpt_ckpt['gpt'])
-        except RuntimeError as exc:
-            raise RuntimeError(
-                'Existing GPT checkpoint is incompatible with the new token-level text conditioning. '
-                'Retrain GPT with --force to use the updated architecture.'
-            ) from exc
-        vqvae.load_state_dict(gpt_ckpt['vqvae'])
-        print("MotionGPT training already complete! Loaded from checkpoint.")
-        return
-    
-    vqvae.eval()
-    gpt_optimizer = torch.optim.AdamW(gpt.parameters(), lr=cfg.lr)
-    base_lrs = [cfg.lr]
-    metrics_logger = _init_metrics_logger('gpt', ['step', 'loss', 'ppl'])
-    print(f"GPT metrics CSV: {metrics_logger['csv_path']}")
-
-    # Pre-tokenise the entire dataset once so the VQ-VAE encode is not
-    # repeated on every training step (it's deterministic, so pure overhead).
-    tokens_dict = _pretokenize_dataset(vqvae, dataset, cfg, device)
-
-    gpt.train()
-    data_iter = cycle(loader)
-    grad_accum_steps = max(1, int(cfg.grad_accum_steps))
-    
-    print("Stage 1b: Training MotionGPT...")
-    start_time = time.time()
-    
-    for step in range(1, cfg.gpt_steps + 1):
-        _apply_lr_schedule(
-            gpt_optimizer,
-            base_lrs,
-            step,
-            cfg.gpt_steps,
-            cfg.warmup_ratio,
-            cfg.min_lr_ratio,
-            cfg.scheduler_type,
-        )
-        gpt_optimizer.zero_grad(set_to_none=True)
-        loss_running = 0.0
-
-        for _ in range(grad_accum_steps):
-            batch = next(data_iter)
-
-            input_tokens, target_tokens, target_mask = _build_gpt_batch_from_tokens(
-                batch, tokens_dict, gpt, device
-            )
-
-            cond, cond_mask = _build_gpt_cond_batch(
-                batch,
-                dataset,
-                empty_cond_tokens,
-                empty_cond_mask,
-                cfg.p_uncond,
-                device,
-            )
-
-            logits = gpt(input_tokens, cond, cond_mask=cond_mask)
-
-            B, T, V = logits.shape
-            loss = F.cross_entropy(
-                logits.reshape(-1, V),
-                target_tokens.reshape(-1),
-                ignore_index=gpt.pad_token,
-                reduction='none'
-            ).reshape(B, T)
-
-            loss = (loss * target_mask.float()).sum() / (target_mask.float().sum() + 1e-8)
-            (loss / grad_accum_steps).backward()
-            loss_running += loss.item()
-
-        nn.utils.clip_grad_norm_(gpt.parameters(), cfg.grad_clip)
-        gpt_optimizer.step()
-
-        loss_avg = loss_running / grad_accum_steps
-        
-        if step % 200 == 0:
-            ppl = math.exp(loss_avg)
-            current_time = time.time()
-            elapsed = current_time - start_time
-            steps_remaining = cfg.gpt_steps - step
-            avg_time_per_step = elapsed / step
-            eta_seconds = steps_remaining * avg_time_per_step
-            eta_hours = int(eta_seconds // 3600)
-            eta_minutes = int((eta_seconds % 3600) // 60)
-            lr_now = gpt_optimizer.param_groups[0]['lr']
-            print(f"step {step:>7d} | loss {loss_avg:.5f} | ppl {ppl:.2f} | lr {lr_now:.2e} | ETA: {eta_hours}h {eta_minutes}m")
-            _append_metrics_row(metrics_logger, {
-                'step': step,
-                'loss': loss_avg,
-                'ppl': ppl,
-            })
-
-        if step % 2_000 == 0:
-            _save_convergence_plot(metrics_logger)
-        
-        if step % 10_000 == 0:
-            os.makedirs('checkpoints', exist_ok=True)
-            torch.save({
-                'gpt': gpt.state_dict(),
-                'vqvae': vqvae.state_dict(),
-                'optimizer': gpt_optimizer.state_dict(),
-                'step': step,
-            }, f'checkpoints/composite_gpt_step{step}.pt')
-            print('Saved GPT checkpoint')
-
-    os.makedirs('checkpoints', exist_ok=True)
-    torch.save({
-        'gpt': gpt.state_dict(),
-        'vqvae': vqvae.state_dict(),
-        'optimizer': gpt_optimizer.state_dict(),
-        'step': cfg.gpt_steps,
-    }, gpt_final_ckpt_path)
-    print(f'Saved final GPT checkpoint: {gpt_final_ckpt_path}')
-    _save_convergence_plot(metrics_logger)
-    print(f"GPT convergence plot: {metrics_logger['plot_path']}")
-    
-    print("MotionGPT training complete!")
 
 
 def _frame_mask_to_sparse_keyframes(
@@ -2233,70 +1718,27 @@ def train_inbetween(
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train composite motion models')
-    parser.add_argument(
-        '--stage',
-        choices=['all', 'vqvae', 'gpt', 'inbetween'],
-        default='all',
-        help='Training stage to run (default: all)'
-    )
+    parser = argparse.ArgumentParser(description='Train diffusion in-betweening model')
     parser.add_argument(
         '--force',
         action='store_true',
-        help='Force retraining even if final checkpoints exist'
+        help='Force retraining even if the final checkpoint exists'
     )
-    parser.add_argument('--vqvae-steps', type=int, default=None, help='Override VQ-VAE training steps')
-    parser.add_argument('--gpt-steps', type=int, default=None, help='Override GPT training steps')
-    parser.add_argument('--inbetween-steps', type=int, default=None, help='Override in-betweening training steps')
     parser.add_argument('--inbetween-resume', type=str, default=None, help='Path to in-betweening checkpoint to resume/fine-tune from')
     parser.add_argument('--inbetween-ckpt-prefix', type=str, default=None, help='Prefix for in-betweening checkpoint filenames; defaults to selector-specific naming')
-    parser.add_argument('--keyframe-source-dir', type=str, default=None, help='Directory of external conditioning motions (id.npy) used for keyframes')
-    parser.add_argument('--disable-selector', action='store_true', help='Disable learned keyframe selector and use dataset keyframes directly')
-    parser.add_argument('--lr', type=float, default=None, help='Override learning rate')
-    parser.add_argument('--batch-size', type=int, default=None, help='Override batch size')
-    parser.add_argument('--num-workers', type=int, default=None, help='Override DataLoader workers')
-    parser.add_argument('--scheduler-type', choices=['cosine', 'constant'], default=None, help='Learning rate scheduler type')
-    parser.add_argument('--warmup-ratio', type=float, default=None, help='Warmup ratio for LR schedule')
-    parser.add_argument('--min-lr-ratio', type=float, default=None, help='Minimum LR ratio for cosine decay')
-    parser.add_argument('--inbetween-lr', type=float, default=None, help='Override in-between model LR')
-    parser.add_argument('--selector-lr', type=float, default=None, help='Override selector LR')
-    parser.add_argument('--selector-mode', choices=SELECTOR_MODE_CHOICES, default=None, help='Keyframe selector architecture')
-    parser.add_argument('--selector-oracle-ckpt', type=str, default=None, help='Frozen in-between checkpoint used to build information-gain oracle labels')
-    parser.add_argument('--selector-oracle-timesteps', type=int, default=None, help='Number of diffusion timesteps to average per oracle reconstruction score')
-    parser.add_argument('--selector-eval-root', type=str, default=None, help='T2M-GPT root used to load the retrieval evaluator for retrieval-gain labels')
-    parser.add_argument('--selector-retrieval-negatives', type=int, default=None, help='Number of negative captions sampled per oracle target for retrieval-gain')
-    parser.add_argument('--ema-decay', type=float, default=None, help='EMA decay for in-between model/selector')
-    parser.add_argument('--selector-curriculum-fraction', type=float, default=None, help='Fraction of total steps to ramp selector regularization')
-    parser.add_argument('--val-interval', type=int, default=None, help='Validation interval for in-between training')
-    parser.add_argument('--val-batches', type=int, default=None, help='Number of validation batches per eval pass')
-    parser.add_argument('--grad-accum-steps', type=int, default=None, help='Gradient accumulation steps')
-    args = parser.parse_args()
+
+    # Keep the training interface minimal. Any non-essential tuning should be
+    # done in config.py; unknown legacy flags are ignored for backward compatibility.
+    args, unknown_args = parser.parse_known_args()
+    if unknown_args:
+        print(
+            'Warning: ignoring non-essential CLI args. '
+            'Set training hyperparameters in config.py instead.\n'
+            f'Ignored args: {" ".join(unknown_args)}'
+        )
+
     main(
-        args.stage,
         args.force,
-        vqvae_steps=args.vqvae_steps,
-        gpt_steps=args.gpt_steps,
-        inbetween_steps=args.inbetween_steps,
         inbetween_resume=args.inbetween_resume,
         inbetween_ckpt_prefix=args.inbetween_ckpt_prefix,
-        keyframe_source_dir=args.keyframe_source_dir,
-        disable_selector=args.disable_selector,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        scheduler_type=args.scheduler_type,
-        warmup_ratio=args.warmup_ratio,
-        min_lr_ratio=args.min_lr_ratio,
-        inbetween_lr=args.inbetween_lr,
-        selector_lr=args.selector_lr,
-        selector_mode=args.selector_mode,
-        selector_oracle_ckpt=args.selector_oracle_ckpt,
-        selector_oracle_timesteps=args.selector_oracle_timesteps,
-        selector_eval_root=args.selector_eval_root,
-        selector_retrieval_negatives=args.selector_retrieval_negatives,
-        ema_decay=args.ema_decay,
-        selector_curriculum_fraction=args.selector_curriculum_fraction,
-        val_interval=args.val_interval,
-        val_batches=args.val_batches,
-        grad_accum_steps=args.grad_accum_steps,
     )

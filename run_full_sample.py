@@ -18,10 +18,9 @@ import numpy as np
 import torch
 from matplotlib.animation import PillowWriter
 
-from arlm_generate_and_finetune import ARLMConfig, _load_arlm_models
+from arlm_generate import ARLMConfig, _load_arlm_models
 from config import CompositeConfig
-from generate import _select_keyframe_indices, load_models
-from utils import encode_text
+from utils import encode_text, load_inbetween_model, select_keyframe_indices
 from visualize import animate_skeleton, recover_from_ric
 
 
@@ -53,20 +52,20 @@ def _extract_step_from_path(path: str | None) -> int | None:
     return None
 
 
-def _default_inbetween_ckpt() -> tuple[str, int | None]:
+def _default_inbetween_ckpt() -> str:
     preferred = [
         os.path.join("checkpoints", "finetuned_inbetween_best.pt"),
         os.path.join("checkpoints", "composite_inbetween_best.pt"),
     ]
     for path in preferred:
         if os.path.exists(path):
-            return path, _extract_step_from_path(path)
+            return path
 
     step = _latest_step(
         checkpoint_glob=os.path.join("checkpoints", "composite_inbetween_step*.pt"),
         prefix="composite_inbetween_step",
     )
-    return os.path.join("checkpoints", f"composite_inbetween_step{step}.pt"), step
+    return os.path.join("checkpoints", f"composite_inbetween_step{step}.pt")
 
 
 def _resolve_arlm_ckpts(
@@ -145,30 +144,16 @@ def _convert_arlm_motion_to_local_stats(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and visualize one full sample (T2M-GPT + diffusion)")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt to generate")
-    parser.add_argument("--length", type=int, default=196, help="Target motion length in frames")
-    parser.add_argument("--gpt-steps", type=int, default=None, help="Local composite GPT checkpoint step (only for loading pipeline config; default: latest)")
-    parser.add_argument("--inbetween-steps", type=int, default=None, help="In-betweening checkpoint step (default: latest)")
     parser.add_argument("--inbetween-ckpt", type=str, default=None, help="Explicit in-betweening checkpoint path; defaults to finetuned/composite best when available")
     parser.add_argument("--t2mgpt-root", type=str, default="D:/Projects/T2M-GPT", help="Path to T2M-GPT repository")
     parser.add_argument("--arlm-vq-ckpt", type=str, default=None, help="Path to T2M-GPT VQ checkpoint (default: <t2mgpt-root>/pretrained/VQVAE/net_last.pth)")
     parser.add_argument("--arlm-gpt-ckpt", type=str, default=None, help="Path to T2M-GPT GPT checkpoint (default: <t2mgpt-root>/pretrained/VQTransformer_corruption05/net_best_fid.pth)")
     parser.add_argument("--arlm-meta-dir", type=str, default=None, help="Path to T2M-GPT mean/std directory (default: <t2mgpt-root>/checkpoints/t2m/VQVAEV3_CB1024_CMT_H1024_NRES3/meta)")
-    parser.add_argument("--categorical-sample", action="store_true", help="Use categorical sampling in T2M-GPT AR stage")
     parser.add_argument("--out-dir", type=str, default="samples", help="Output directory")
     parser.add_argument("--out-name", type=str, default="full_sample", help="Output name prefix")
     parser.add_argument("--device", type=str, default=None, help="Device, e.g. cuda or cpu")
-    parser.add_argument("--diff-guidance", type=float, default=2.5, help="Diffusion CFG scale")
-    parser.add_argument("--disable-selector", action="store_true", help="Disable learned keyframe selector")
-    parser.add_argument("--keyframe-strategy", type=str, choices=["interval", "random"], default=None)
-    parser.add_argument("--keyframe-interval", type=int, default=5)
-    parser.add_argument("--keyframe-count", type=int, default=None)
-    parser.add_argument("--keyframe-min", type=int, default=None)
-    parser.add_argument("--keyframe-max", type=int, default=None)
-    parser.add_argument("--no-keyframe-ends", action="store_true", help="Do not force first/last frame in random keyframe strategy")
     parser.add_argument("--stride", type=int, default=1, help="Visualization frame stride")
     parser.add_argument("--interval-ms", type=int, default=80, help="Animation interval in ms")
-    parser.add_argument("--ar-clamp-sigma", type=float, default=0.0,
-                        help="Clamp T2M-GPT VQ output to ±N sigma. Set <=0 to disable (default: disabled).")
     return parser.parse_args()
 
 
@@ -177,31 +162,13 @@ def main() -> None:
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    gpt_steps = args.gpt_steps
-    if gpt_steps is None:
-        gpt_steps = _latest_step(
-            checkpoint_glob=os.path.join("checkpoints", "composite_gpt_step*.pt"),
-            prefix="composite_gpt_step",
-        )
-
     inbetween_ckpt_path = args.inbetween_ckpt
-    inbetween_steps = args.inbetween_steps
     if inbetween_ckpt_path is None:
-        inbetween_ckpt_path, inferred_step = _default_inbetween_ckpt()
-        if inbetween_steps is None:
-            inbetween_steps = inferred_step
+        inbetween_ckpt_path = _default_inbetween_ckpt()
     else:
         inbetween_ckpt_path = os.path.abspath(inbetween_ckpt_path)
-        if inbetween_steps is None:
-            inbetween_steps = _extract_step_from_path(inbetween_ckpt_path)
 
-    if inbetween_steps is None:
-        inbetween_steps = 0
-
-    cfg = CompositeConfig(
-        gpt_steps=gpt_steps,
-        inbetween_steps=inbetween_steps,
-    )
+    cfg = CompositeConfig()
 
     device_obj = torch.device(device)
 
@@ -216,7 +183,7 @@ def main() -> None:
     print(f"Using AR model: T2M-GPT ({arlm_gpt_ckpt})")
     print(f"Using diffusion checkpoint: {inbetween_ckpt_path}")
 
-    _, _, inbetween_model, diff_inbetween, clip_model, mean, std, fdim = load_models(
+    inbetween_model, diff_inbetween, clip_model, mean, std, fdim = load_inbetween_model(
         cfg,
         device,
         inbetween_ckpt_path=inbetween_ckpt_path,
@@ -247,7 +214,7 @@ def main() -> None:
         vq_model=vq_model_arlm,
         gpt_model=gpt_model_arlm,
         device=device_obj,
-        categorical_sample=bool(args.categorical_sample),
+        categorical_sample=False,
     )
     ar_motion, ar_motion_norm = _convert_arlm_motion_to_local_stats(
         ar_motion_native_norm=ar_motion_native_norm,
@@ -255,30 +222,25 @@ def main() -> None:
         arlm_std=arlm_std,
         local_mean=mean,
         local_std=std,
-        clamp_sigma=float(args.ar_clamp_sigma),
+        clamp_sigma=0.0,
     )
     native_ar_length = int(ar_motion_norm.shape[0])
-    if native_ar_length != int(args.length):
-        print(
-            f"Requested length {int(args.length)} differs from native T2M-GPT length {native_ar_length}; "
-            "using native length to avoid corrupting HumanML3D features with linear resampling."
-        )
 
     cond = encode_text(clip_model, [args.prompt])
     cond_uncond = encode_text(clip_model, [""])
 
     effective_length = int(ar_motion_norm.shape[0])
-    use_selector = cfg.use_learned_keyframe_selector and (not args.disable_selector)
+    use_selector = cfg.use_learned_keyframe_selector
     selector_model = getattr(inbetween_model, "keyframe_selector", None)
     selector_used = bool(use_selector and selector_model is not None)
     selector_probs = None
     selector_fallback_used = False
 
-    strategy = args.keyframe_strategy or cfg.keyframe_strategy
-    keyframe_count = args.keyframe_count if args.keyframe_count is not None else cfg.keyframe_count
-    keyframe_min = args.keyframe_min if args.keyframe_min is not None else cfg.keyframe_min
-    keyframe_max = args.keyframe_max if args.keyframe_max is not None else cfg.keyframe_max
-    include_ends = (not args.no_keyframe_ends) if args.no_keyframe_ends else cfg.keyframe_include_ends
+    strategy = cfg.keyframe_strategy
+    keyframe_count = cfg.keyframe_count
+    keyframe_min = cfg.keyframe_min
+    keyframe_max = cfg.keyframe_max
+    include_ends = cfg.keyframe_include_ends
 
     if selector_used:
         selector_model.eval()
@@ -291,9 +253,9 @@ def main() -> None:
         keyframe_indices = torch.nonzero(selector_mask_st[0] > 0.5, as_tuple=False).squeeze(1)
         if keyframe_indices.numel() <= 2:
             selector_fallback_used = True
-            idx_list = _select_keyframe_indices(
+            idx_list = select_keyframe_indices(
                 length=effective_length,
-                keyframe_interval=args.keyframe_interval,
+                keyframe_interval=cfg.keyframe_interval,
                 strategy=strategy,
                 keyframe_count=keyframe_count,
                 keyframe_min=keyframe_min,
@@ -310,9 +272,9 @@ def main() -> None:
         else:
             print(f"Selected {int(keyframe_indices.numel())} keyframes with learned selector")
     else:
-        idx_list = _select_keyframe_indices(
+        idx_list = select_keyframe_indices(
             length=effective_length,
-            keyframe_interval=args.keyframe_interval,
+            keyframe_interval=cfg.keyframe_interval,
             strategy=strategy,
             keyframe_count=keyframe_count,
             keyframe_min=keyframe_min,
@@ -339,7 +301,7 @@ def main() -> None:
         keyframes=keyframes_batch,
         keyframe_indices=keyframe_indices_batch,
         keyframe_mask=keyframe_mask_batch,
-        guidance_scale=args.diff_guidance,
+        guidance_scale=cfg.guidance_scale,
         cond_uncond=cond_uncond,
     )[0]
 
@@ -372,7 +334,6 @@ def main() -> None:
 
     metadata = {
         "prompt": args.prompt,
-        "length_requested": int(args.length),
         "length_native_ar": native_ar_length,
         "length_generated": int(motion.shape[0]),
         "feature_dim": int(motion.shape[1]),
@@ -380,15 +341,12 @@ def main() -> None:
         "ar_motion_path": os.path.abspath(ar_motion_path),
         "ar_motion_native_norm_path": os.path.abspath(ar_motion_native_norm_path),
         "ar_motion_local_norm_path": os.path.abspath(ar_motion_local_norm_path),
-        "local_gpt_steps": int(gpt_steps),
-        "inbetween_steps": int(inbetween_steps),
         "inbetween_ckpt": os.path.abspath(inbetween_ckpt_path),
         "t2mgpt_root": t2mgpt_root,
         "t2mgpt_vq_ckpt": os.path.abspath(arlm_vq_ckpt),
         "t2mgpt_gpt_ckpt": os.path.abspath(arlm_gpt_ckpt),
         "t2mgpt_meta_dir": arlm_meta_dir,
         "device": str(device),
-        "ar_clamp_sigma": float(args.ar_clamp_sigma),
         "used_selector": selector_used,
         "selector_fallback_used": selector_fallback_used,
         "keyframe_count": int(keyframe_idx.numel()),

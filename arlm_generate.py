@@ -1,15 +1,11 @@
-"""Generate ARLM motions and fine-tune in-between diffusion from a resume checkpoint.
+"""Generate ARLM motions (HumanML3D feature-space .npy files).
 
-This script does two stages:
-1) Use T2M-GPT (ARLM) to generate one motion per HumanML3D id and save
-   feature-space motions (263-dim joint vectors) to an output directory.
-2) Launch this repo's in-between diffusion training using those generated
-   motions as keyframe conditioning input.
+This script only handles ARLM data generation. In-between model training is
+handled directly by train.py / pipeline.py train.
 """
 
 import argparse
 import os
-import subprocess
 import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -254,45 +250,8 @@ def generate_arlm_dataset(args):
     print(f"ARLM generation finished: saved={saved}, skipped={skipped}, out={output_dir}")
 
 
-def run_finetune(args):
-    train_py = os.path.join(os.path.abspath(args.project_root), "train.py")
-    resume_ckpt = os.path.abspath(args.resume_ckpt)
-    keyframe_source_dir = os.path.abspath(args.output_dir)
-
-    if not os.path.exists(train_py):
-        raise FileNotFoundError(f"Missing train.py at: {train_py}")
-    if not os.path.exists(resume_ckpt):
-        raise FileNotFoundError(f"Missing resume checkpoint: {resume_ckpt}")
-    if not os.path.exists(keyframe_source_dir):
-        raise FileNotFoundError(f"Missing generated ARLM dataset dir: {keyframe_source_dir}")
-
-    cmd = [
-        sys.executable,
-        train_py,
-        "--stage",
-        "inbetween",
-        "--inbetween-resume",
-        resume_ckpt,
-        "--inbetween-ckpt-prefix",
-        args.finetune_ckpt_prefix,
-        "--inbetween-steps",
-        str(int(args.finetune_total_steps)),
-        "--keyframe-source-dir",
-        keyframe_source_dir,
-        "--lr",
-        str(float(args.finetune_lr)),
-    ]
-    if args.disable_selector:
-        cmd.append("--disable-selector")
-
-    print("Launching fine-tune command:")
-    print(" ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=os.path.abspath(args.project_root))
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate ARLM dataset and fine-tune in-between diffusion")
-    parser.add_argument("--project-root", type=str, default=".", help="Path to individual_project root")
+    parser = argparse.ArgumentParser(description="Generate ARLM HumanML3D feature motions")
     parser.add_argument("--humanml-root", type=str, default="humanml", help="Path to HumanML3D root used by individual_project")
     parser.add_argument("--t2mgpt-root", type=str, default="D:/Projects/T2M-GPT", help="Path to T2M-GPT repository")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Split to generate ARLM conditioning for")
@@ -312,46 +271,13 @@ def parse_args():
     )
     parser.add_argument("--categorical-sample", action="store_true", help="Use stochastic categorical token sampling instead of greedy")
     parser.add_argument("--max-len", type=int, default=196, help="Max generated sequence length")
-
-    parser.add_argument(
-        "--resume-ckpt",
-        type=str,
-        default="checkpoints/composite_inbetween_step100000.pt",
-        help="In-between checkpoint to resume from",
-    )
-    parser.add_argument(
-        "--finetune-total-steps",
-        type=int,
-        default=120000,
-        help="Final absolute step after fine-tuning (e.g., 120000 resumes from 100k for +20k)",
-    )
-    parser.add_argument(
-        "--finetune-ckpt-prefix",
-        type=str,
-        default="finetuned_inbetween",
-        help="Checkpoint filename prefix for fine-tuned in-between model",
-    )
-    parser.add_argument("--finetune-lr", type=float, default=1e-5, help="Learning rate for fine-tune")
-    parser.add_argument(
-        "--disable-selector",
-        action="store_true",
-        help="Disable learned keyframe selector during fine-tuning",
-    )
-    parser.add_argument(
-        "--generate-only",
-        action="store_true",
-        help="Only generate the ARLM HumanML3D feature dataset and skip diffusion fine-tuning",
-    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     generate_arlm_dataset(args)
-    if args.generate_only:
-        print("Generation complete; skipping fine-tuning because --generate-only was set.")
-        return
-    run_finetune(args)
+    print("Generation complete.")
 
 
 if __name__ == "__main__":

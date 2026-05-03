@@ -1,185 +1,229 @@
-# Composite Motion Generation
+# In-Between Motion Refinement (T2M-GPT + Diffusion)
 
-This repository implements a **three-stage text-to-motion pipeline**:
+This repository now focuses on a single training target:
 
-1. **VQ-VAE** — tokenises continuous motion into discrete codes.
-2. **GPT (ARLM)** — autoregressively generates a full coarse-motion token sequence from a text prompt.
-3. **Diffusion in-betweening + Keyframe Selector** — the learned selector identifies the most expressive frames in the GPT output; the diffusion model then refines the full sequence by in-betweening between those keyframes.
+- diffusion in-betweening with optional learned keyframe selection
 
-The simplest way to use the project is through the unified entry point:
+AR motion generation is handled by external T2M-GPT checkpoints. This repo uses those generated motions as conditioning input and refines them with the in-between diffusion model.
+
+## Entry Point
+
+Use the unified CLI:
 
 ```bash
 python pipeline.py <command> [options]
 ```
 
-## Architecture Overview
+## Current Pipeline
 
-```
+```text
 Text prompt
-    │
-    ▼
-CLIP text encoder (ViT-B/32, frozen)
-    │
-    ▼
-MotionGPT  ──── cross-attention conditioning at every layer ─── CLIP embedding
-  (512-d, 12 layers, codebook 1024)
-    │  autoregressive token generation
-    ▼
-VQ-VAE decoder  (residual blocks, GroupNorm)
-    │  coarse full-length motion
-    ▼
-Learned Keyframe Selector
-    │  sparse keyframe mask + keyframe frames
-    ▼
-Diffusion In-betweening (InbetweenTransformer, 512-d 12-layer)
-    │  denoising conditioned on keyframes + text
-    ▼
-Final refined motion (T, 263)
+  -> T2M-GPT (external pretrained AR model)
+  -> coarse HumanML3D motion features (263-d)
+  -> keyframe selection (heuristic or learned selector)
+  -> diffusion in-betweening refinement
+  -> final refined motion + visualization
 ```
 
 ## Quick Start
 
-### 1) Train all stages
+### 1) Train in-between diffusion
 
 ```bash
-python pipeline.py train --stage all
+python pipeline.py train
+```
+
+Train all selector variants in one command (heuristic, text_alignment, saliency, information_gain, retrieval_gain):
+
+```bash
+python pipeline.py train-selectors-all --force
+```
+
+Resume training from a checkpoint:
+
+```bash
+python pipeline.py train --inbetween-resume checkpoints/composite_inbetween_best.pt
 ```
 
 ### 2) Generate one full sample + visualization
 
 ```bash
-python pipeline.py sample --prompt "a person walks forward then jumps and waves" --length 120 --out-name demo
+python pipeline.py sample \
+  --prompt "a person walks forward then jumps and waves" \
+  --out-name demo
 ```
 
-### 3) Visualize a saved motion file
+### 3) Evaluate models/selector variants
+
+```bash
+python pipeline.py evaluate --models all
+```
+
+### 4) Visualize a saved motion file
 
 ```bash
 python pipeline.py visualize samples/demo_motion.npy
 ```
 
-## Unified Commands
+## Commands
 
-### Train
+### train
 
-Train a single stage or all stages sequentially:
-
-```bash
-# All stages in sequence
-python pipeline.py train --stage all
-
-# Individual stages
-python pipeline.py train-vqvae --vqvae-steps 100000
-python pipeline.py train-gpt   --gpt-steps 200000
-python pipeline.py train-diffusion --inbetween-steps 200000
-
-# Resume/override
-python pipeline.py train --stage inbetween --inbetween-resume checkpoints/composite_inbetween_step100000.pt --inbetween-steps 200000
-```
-
-Useful options for `train`:
-- `--force` — retrain even if a checkpoint already exists
-- `--vqvae-steps`, `--gpt-steps`, `--inbetween-steps`
-- `--inbetween-resume`, `--inbetween-ckpt-prefix`
-- `--keyframe-source-dir` — use pre-generated ARLM motions as conditioning
-- `--disable-selector` — disable the learned keyframe selector
-- `--lr`, `--batch-size`, `--grad-accum-steps`
-- `--scheduler-type cosine|constant`, `--warmup-ratio`, `--min-lr-ratio`
-- `--inbetween-lr`, `--selector-lr`, `--ema-decay`
-- `--val-interval`, `--val-batches`
-
-### Full Sample Generation
+Runs in-between training via `train.py`.
 
 ```bash
-python pipeline.py sample --prompt "a person walks forward" --length 120 --out-dir samples --out-name sample_a
+python pipeline.py train
+python pipeline.py train --inbetween-resume checkpoints/composite_inbetween_step100000.pt
 ```
 
-Useful options:
-- `--diff-guidance` — classifier-free guidance scale (default 2.5)
-- `--disable-selector` — fall back to heuristic keyframe selection
-- `--keyframe-strategy interval|random`, `--keyframe-interval`
+Useful flags:
 
-### Fine-Tune Diffusion From ARLM Pred Files
+- `--force`
+- `--inbetween-resume`
+- `--inbetween-ckpt-prefix`
 
-Converts `*_pred.npy` files and runs in-between fine-tuning:
+### train-selectors-all
+
+Runs sequential training for all supported selector variants by temporarily patching `InbetweenTrainConfig` in `config.py` for each run and restoring the original config afterward.
 
 ```bash
-python pipeline.py finetune --sample-dir TRAIN_ALL_GEN --resume-ckpt checkpoints/composite_inbetween_step200000.pt --finetune-steps 40000
+python pipeline.py train-selectors-all --force
+python pipeline.py train-selectors-all --only text_alignment,saliency
+python pipeline.py train-selectors-all --oracle-ckpt checkpoints/composite_inbetween_text_alignment_best.pt
 ```
 
-### ARLM Generate + Fine-Tune (All-in-One)
+Useful flags:
 
-Generates ARLM conditioning motions and launches in-between fine-tune:
+- `--force`
+- `--only`
+- `--oracle-ckpt`
+- `--keep-config`
+
+### sample
+
+Runs full sample generation via `run_full_sample.py`.
 
 ```bash
-python pipeline.py arlm-finetune --t2mgpt-root D:/Projects/T2M-GPT --resume-ckpt checkpoints/composite_inbetween_step200000.pt --finetune-total-steps 240000
+python pipeline.py sample --prompt "a person walks forward"
 ```
 
-### Retrain + Fine-Tune In One Command
+Useful flags:
 
-Retrain diffusion in-betweening to 200k with selector enabled, then fine-tune for 40k at reduced LR:
+- `--inbetween-ckpt`
+- `--t2mgpt-root`
+- `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
+- `--out-dir`, `--out-name`
+- `--device`, `--stride`, `--interval-ms`
+
+### arlm-generate
+
+Generates ARLM HumanML3D feature motions only (no training side effects).
 
 ```bash
-python pipeline.py retrain-finetune --base-steps 200000 --finetune-steps 40000 --base-lr 1e-4 --finetune-lr 1e-5 --batch-size 32 --grad-accum-steps 4
+python pipeline.py arlm-generate --t2mgpt-root D:/Projects/T2M-GPT
 ```
 
-Default selector is enabled.  This gives an effective batch size of 128 via gradient accumulation.
+Useful flags:
 
-### Evaluate
+- `--humanml-root`
+- `--split`
+- `--output-dir`
+- `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
 
-Run HumanML3D metrics (FID, R-Precision, Diversity, Multimodality):
+### finetune (legacy helper)
+
+Converts legacy `*_pred.npy` samples (for example from `TRAIN_ALL_GEN`) to HumanML3D feature format and launches resumed training.
 
 ```bash
-python pipeline.py evaluate --models composite --num-samples 256
-python pipeline.py evaluate --models all --composite-gpt-steps 200000 --composite-inbetween-steps 200000
+python pipeline.py finetune \
+  --sample-dir TRAIN_ALL_GEN \
+  --resume-ckpt checkpoints/composite_inbetween_best.pt
 ```
 
-### Visualize
+If you already generate ARLM conditioning via `arlm-generate`, this helper is usually unnecessary.
+
+### evaluate
+
+Runs HumanML3D evaluation via `eval_ML3D.py`.
 
 ```bash
-python pipeline.py visualize samples/sample_a_motion.npy
+python pipeline.py evaluate --models all
+python pipeline.py evaluate --models t2mgpt
+python pipeline.py evaluate --models composite
 ```
 
-## Recommended Training Recipe
+`--models composite` expands to all composite selector variants:
+
+- `composite_heuristic`
+- `composite_text_alignment`
+- `composite_information_gain`
+- `composite_retrieval_gain`
+
+Useful flags exposed in `pipeline.py`:
+
+- `--metrics`
+- `--device`
+- `--humanml-root`, `--t2mgpt-root`
+- `--composite-inbetween-ckpt`
+- `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
+- `--results-dir`, `--results-path`
+- `--load-results`, `--save-results`
+
+### visualize
 
 ```bash
-# 1. Train VQ-VAE (100k steps)
-python pipeline.py train-vqvae --vqvae-steps 100000 --batch-size 32 --grad-accum-steps 1
-
-# 2. Train GPT on VQ-VAE tokens (200k steps)
-python pipeline.py train-gpt --gpt-steps 200000 --batch-size 32 --grad-accum-steps 4
-
-# 3. Train diffusion in-betweening (200k steps)
-python pipeline.py train-diffusion --inbetween-steps 200000 --batch-size 32 --grad-accum-steps 4
-
-# 4. Generate ARLM motions for the training split and fine-tune inbetweening on them
-python pipeline.py arlm-finetune \
-    --t2mgpt-root D:/Projects/T2M-GPT \
-    --resume-ckpt checkpoints/composite_inbetween_best.pt \
-    --finetune-total-steps 240000 \
-    --finetune-lr 1e-5
-
-# 5. Evaluate
-python pipeline.py evaluate --models composite --num-samples 1024
+python pipeline.py visualize samples/sample_motion.npy
 ```
 
-## What Gets Saved
+## Config-Driven Settings
+
+Most behavior is configured in `config.py`, including:
+
+- optimizer and schedule
+- keyframe selector settings
+- selector mode and loss weights
+- diffusion architecture and loss weights
+- validation cadence and checkpoint behavior
+
+Prefer changing defaults in `config.py` rather than adding CLI overrides.
+
+## Recommended Workflow
+
+```bash
+# 1) Train baseline in-between model
+python pipeline.py train
+
+# 2) (Optional) Generate ARLM conditioning set
+python pipeline.py arlm-generate --t2mgpt-root D:/Projects/T2M-GPT
+
+# 3) Continue training from the best checkpoint
+python pipeline.py train --inbetween-resume checkpoints/composite_inbetween_best.pt
+
+# 4) Evaluate all selector variants + T2M-GPT
+python pipeline.py evaluate --models all
+
+# 5) Generate qualitative sample
+python pipeline.py sample --prompt "a person spins and bows" --out-name qual_spin_bow
+```
+
+## Outputs
 
 ### Checkpoints
 
-- `checkpoints/composite_vqvae_stepN.pt`
-- `checkpoints/composite_gpt_stepN.pt`
-- `checkpoints/composite_inbetween_stepN.pt` / `composite_inbetween_best.pt`
+- `checkpoints/composite_inbetween_stepN.pt`
+- `checkpoints/composite_inbetween_best.pt`
+- selector-mode specific checkpoints (for example `composite_inbetween_information_gain_best.pt`) if trained with mode-specific prefixes
 
-In-between checkpoints contain `inbetween`, `inbetween_ema`, and (when selector training is on) `selector` + `selector_ema`.
+### Training logs
 
-### Training Diagnostics
+- `training_logs/inbetween_YYYYMMDD_HHMMSS.csv`
+- `training_logs/inbetween_YYYYMMDD_HHMMSS.png`
 
-- `training_logs/vqvae_YYYYMMDD_HHMMSS.{csv,png}`
-- `training_logs/gpt_YYYYMMDD_HHMMSS.{csv,png}`
-- `training_logs/inbetween_YYYYMMDD_HHMMSS.{csv,png}`
+### Sample outputs
 
-### Sample Outputs
-
+- `samples/<name>_ar_motion.npy`
+- `samples/<name>_ar_motion_native_norm.npy`
+- `samples/<name>_ar_motion_local_norm.npy`
 - `samples/<name>_motion.npy`
 - `samples/<name>_keyframes.npy`
 - `samples/<name>_keyframe_indices.npy`
@@ -191,20 +235,17 @@ In-between checkpoints contain `inbetween`, `inbetween_ema`, and (when selector 
 | File | Purpose |
 |---|---|
 | `pipeline.py` | Unified CLI entry point |
-| `config.py` | All training/inference defaults |
-| `train.py` | Core training loop (VQ-VAE → GPT → Diffusion) |
+| `config.py` | Config defaults for training/inference/eval |
+| `train.py` | In-between diffusion training loop |
 | `run_full_sample.py` | End-to-end sample generation |
-| `generate.py` | Inference helpers (`load_models`, `generate_composite`) |
-| `finetune_inbetween_on_arlm_samples.py` | Convert ARLM outputs and fine-tune diffusion |
-| `arlm_generate_and_finetune.py` | ARLM generation + fine-tune orchestration |
-| `eval_ML3D.py` | HumanML3D evaluation (FID, R-Precision, …) |
+| `arlm_generate.py` | ARLM dataset generation |
+| `eval_ML3D.py` | HumanML3D evaluation |
+| `finetune_inbetween_on_arlm_samples.py` | Legacy conversion + resume helper |
 | `visualize.py` | Motion rendering utilities |
-| `models/vqvae.py` | ResBlock VQ-VAE |
-| `models/gpt.py` | Cross-attention GPT |
-| `models/diffusion.py` | Diffusion in-betweening + keyframe selector |
+| `models/diffusion.py` | Diffusion in-betweening + selector modules |
 
 ## Environment Notes
 
-- Use the project virtual environment for consistent dependencies.
-- For T2M-GPT integration, `--t2mgpt-root` must point to a valid T2M-GPT checkout with pretrained weights.
-
+- Use a dedicated Python environment with the required scientific stack.
+- For T2M-GPT integration, `--t2mgpt-root` must point to a valid checkout with pretrained weights.
+- Ensure HumanML3D stats exist at `humanml/Mean.npy` and `humanml/Std.npy`.

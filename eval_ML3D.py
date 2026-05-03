@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -20,9 +21,8 @@ import torch
 from scipy import linalg
 from torch.utils.data import DataLoader
 
-from arlm_generate_and_finetune import ARLMConfig, _load_arlm_models
+from arlm_generate import ARLMConfig, _load_arlm_models
 from config import CompositeConfig
-from generate import _select_keyframe_indices, load_models
 from run_full_sample import (
     _convert_arlm_motion_to_local_stats,
     _default_inbetween_ckpt,
@@ -31,7 +31,7 @@ from run_full_sample import (
     _load_arlm_stats,
     _resolve_arlm_ckpts,
 )
-from utils import encode_text
+from utils import encode_text, load_inbetween_model, select_keyframe_indices
 from visualize import recover_from_ric
 
 
@@ -45,8 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         type=str,
-        default="composite,t2mgpt",
-        help="Comma-separated models: composite, t2mgpt, gpt, all",
+        default="all",
+        help=(
+            "Comma-separated models: all, t2mgpt, gpt, composite, "
+            "composite_heuristic, composite_text_alignment, "
+            "composite_information_gain, composite_retrieval_gain"
+        ),
     )
     parser.add_argument(
         "--metrics",
@@ -59,6 +63,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-samples", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="DataLoader worker count. Use 0 if multiprocessing causes issues.",
+    )
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="Disable DataLoader pinned memory when using CUDA.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--humanml-root", type=str, default="humanml")
@@ -118,7 +133,25 @@ def parse_args() -> argparse.Namespace:
         "--composite-inbetween-ckpt",
         type=str,
         default=None,
-        help="Explicit composite in-between checkpoint; defaults to best/latest",
+        help="Explicit checkpoint override for all composite selector variants",
+    )
+    parser.add_argument(
+        "--composite-text-alignment-ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint override for composite_text_alignment",
+    )
+    parser.add_argument(
+        "--composite-information-gain-ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint override for composite_information_gain",
+    )
+    parser.add_argument(
+        "--composite-retrieval-gain-ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint override for composite_retrieval_gain",
     )
     parser.add_argument(
         "--composite-inbetween-steps",
@@ -186,13 +219,21 @@ def parse_csv(value: str) -> list[str]:
 
 
 def resolve_models(value: str) -> list[str]:
+    composite_variants = [
+        "composite_heuristic",
+        "composite_text_alignment",
+        "composite_information_gain",
+        "composite_retrieval_gain",
+    ]
     requested = []
     for model_name in parse_csv(value.lower()):
         if model_name == "all":
-            requested.extend(["composite", "t2mgpt"])
+            requested.extend(["t2mgpt", *composite_variants])
+        elif model_name == "composite":
+            requested.extend(composite_variants)
         elif model_name == "gpt":
             requested.append("t2mgpt")
-        elif model_name in {"composite", "t2mgpt"}:
+        elif model_name in {"t2mgpt", *composite_variants}:
             requested.append(model_name)
         else:
             raise ValueError(f"Unsupported model name: {model_name}")
@@ -272,6 +313,8 @@ def build_eval_loader_and_wrapper(
     t2mgpt_root: str,
     batch_size: int,
     device: torch.device,
+    num_workers: int = 4,
+    pin_memory: bool = True,
 ):
     prepare_t2mgpt_imports(t2mgpt_root)
     with pushd(t2mgpt_root):
@@ -282,14 +325,17 @@ def build_eval_loader_and_wrapper(
 
         word_vectorizer = WordVectorizer("./glove", "our_vab")
         dataset = Text2MotionDataset("t2m", "test", word_vectorizer)
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=collate_fn,
-            drop_last=False,
-        )
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "num_workers": int(num_workers),
+            "pin_memory": bool(pin_memory and device.type == "cuda"),
+            "collate_fn": collate_fn,
+            "drop_last": False,
+        }
+        if int(num_workers) > 0:
+            loader_kwargs["persistent_workers"] = True
+        loader = DataLoader(dataset, **loader_kwargs)
         dataset_opt_path = os.path.join(
             t2mgpt_root,
             "checkpoints",
@@ -492,6 +538,17 @@ class T2MGPTGenerator(BaseGenerator):
             device,
         )
         self.eval_mean, self.eval_std, _ = _load_arlm_stats(self.t2mgpt_root, device)
+        self._text_cache: dict[str, torch.Tensor] = {}
+        self._cond_uncond: torch.Tensor | None = None
+
+    def _encode_prompt_cached(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        cond = self._text_cache.get(prompt)
+        if cond is None:
+            cond = encode_text(self.clip_model, [prompt])
+            self._text_cache[prompt] = cond
+        if self._cond_uncond is None:
+            self._cond_uncond = encode_text(self.clip_model, [""])
+        return cond, self._cond_uncond
         self.clamp_sigma = float(clamp_sigma)
 
     def generate(self, prompt: str, target_length: int, stochastic: bool) -> np.ndarray:
@@ -518,17 +575,10 @@ class CompositeGenerator(BaseGenerator):
         t2mgpt_root: str,
         device: torch.device,
         inbetween_ckpt: str | None,
-        inbetween_steps: int | None,
-        gpt_steps: int | None,
         arlm_vq_ckpt: str | None,
         arlm_gpt_ckpt: str | None,
+        selector_mode: str,
         disable_selector: bool,
-        keyframe_strategy: str | None,
-        keyframe_interval: int,
-        keyframe_count: int | None,
-        keyframe_min: int | None,
-        keyframe_max: int | None,
-        include_ends: bool,
         diff_guidance: float,
         clamp_sigma: float,
     ):
@@ -537,34 +587,21 @@ class CompositeGenerator(BaseGenerator):
         self.t2mgpt_root = os.path.abspath(t2mgpt_root)
         self.diff_guidance = float(diff_guidance)
         self.disable_selector = bool(disable_selector)
-        self.keyframe_strategy = keyframe_strategy
-        self.keyframe_interval = int(keyframe_interval)
-        self.keyframe_count = keyframe_count
-        self.keyframe_min = keyframe_min
-        self.keyframe_max = keyframe_max
-        self.include_ends = include_ends
         self.clamp_sigma = float(clamp_sigma)
 
-        resolved_ckpt = inbetween_ckpt
-        resolved_steps = inbetween_steps
-        if resolved_ckpt is None:
-            resolved_ckpt, inferred_step = _default_inbetween_ckpt()
-            if resolved_steps is None:
-                resolved_steps = inferred_step
+        if inbetween_ckpt is None:
+            resolved_ckpt = _default_inbetween_ckpt_for_mode(selector_mode)
         else:
-            resolved_ckpt = os.path.abspath(resolved_ckpt)
-            if resolved_steps is None:
-                resolved_steps = _extract_step_from_path(resolved_ckpt)
-        if resolved_steps is None:
-            resolved_steps = 0
+            resolved_ckpt = os.path.abspath(inbetween_ckpt)
 
         cfg = CompositeConfig(
             root=os.path.abspath(humanml_root),
-            gpt_steps=gpt_steps or 0,
-            inbetween_steps=resolved_steps,
+            selector_mode=selector_mode,
         )
+        if disable_selector:
+            cfg.use_learned_keyframe_selector = False
         self.cfg = cfg
-        _, _, self.inbetween_model, self.diff_inbetween, self.clip_model, local_mean, local_std, self.fdim = load_models(
+        self.inbetween_model, self.diff_inbetween, self.clip_model, local_mean, local_std, self.fdim = load_inbetween_model(
             cfg,
             str(device),
             inbetween_ckpt_path=resolved_ckpt,
@@ -585,10 +622,10 @@ class CompositeGenerator(BaseGenerator):
 
     def _select_keyframes(self, ar_motion_norm: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         effective_length = int(ar_motion_norm.shape[0])
-        strategy = self.keyframe_strategy or self.cfg.keyframe_strategy
-        keyframe_count = self.keyframe_count if self.keyframe_count is not None else self.cfg.keyframe_count
-        keyframe_min = self.keyframe_min if self.keyframe_min is not None else self.cfg.keyframe_min
-        keyframe_max = self.keyframe_max if self.keyframe_max is not None else self.cfg.keyframe_max
+        strategy = self.cfg.keyframe_strategy
+        keyframe_count = self.cfg.keyframe_count
+        keyframe_min = self.cfg.keyframe_min
+        keyframe_max = self.cfg.keyframe_max
         selector_model = getattr(self.inbetween_model, "keyframe_selector", None)
         use_selector = self.cfg.use_learned_keyframe_selector and (not self.disable_selector)
         if use_selector and selector_model is not None:
@@ -603,14 +640,14 @@ class CompositeGenerator(BaseGenerator):
             if keyframe_indices.numel() > 2:
                 return keyframe_indices
 
-        idx_list = _select_keyframe_indices(
+        idx_list = select_keyframe_indices(
             length=effective_length,
-            keyframe_interval=self.keyframe_interval,
+            keyframe_interval=self.cfg.keyframe_interval,
             strategy=strategy,
             keyframe_count=keyframe_count,
             keyframe_min=keyframe_min,
             keyframe_max=keyframe_max,
-            include_ends=self.include_ends,
+            include_ends=self.cfg.keyframe_include_ends,
         )
         return torch.tensor(idx_list, dtype=torch.long, device=self.device)
 
@@ -634,8 +671,7 @@ class CompositeGenerator(BaseGenerator):
             clamp_sigma=self.clamp_sigma,
         )
 
-        cond = encode_text(self.clip_model, [prompt])
-        cond_uncond = encode_text(self.clip_model, [""])
+        cond, cond_uncond = self._encode_prompt_cached(prompt)
         keyframe_indices = self._select_keyframes(ar_motion_norm, cond)
         keyframes_norm = ar_motion_norm[keyframe_indices]
 
@@ -664,6 +700,8 @@ def build_motion_batch(
     eval_mean: np.ndarray,
     eval_std: np.ndarray,
     stochastic: bool,
+    need_jerk: bool = False,
+    need_foot_skating: bool = False,
 ) -> MotionBatch:
     raw_motions: list[np.ndarray] = []
     jerk_scores: list[float] = []
@@ -673,10 +711,13 @@ def build_motion_batch(
     for caption, length in zip(captions, lengths):
         raw_motion = generator.generate(caption, int(length), stochastic=stochastic)
         raw_motion = raw_motion.astype(np.float32)
-        joints = joints_from_motion(raw_motion)
         raw_motions.append(raw_motion)
-        jerk_scores.append(compute_jerk(joints))
-        foot_scores.append(compute_foot_skating(joints))
+        if need_jerk or need_foot_skating:
+            joints = joints_from_motion(raw_motion)
+            if need_jerk:
+                jerk_scores.append(compute_jerk(joints))
+            if need_foot_skating:
+                foot_scores.append(compute_foot_skating(joints))
         normalized = normalize_motion(raw_motion, eval_mean, eval_std)
         padded_motion, seq_len = pad_motion(normalized)
         padded.append(torch.from_numpy(padded_motion))
@@ -745,6 +786,8 @@ def evaluate_model(
             eval_mean=eval_mean,
             eval_std=eval_std,
             stochastic=categorical_sample,
+            need_jerk="jerk" in metrics,
+            need_foot_skating="foot_skating" in metrics,
         )
 
         pred_padded = first_pass.padded.to(device)
@@ -783,6 +826,8 @@ def evaluate_model(
                     eval_mean=eval_mean,
                     eval_std=eval_std,
                     stochastic=True,
+                    need_jerk=False,
+                    need_foot_skating=False,
                 )
                 extra_padded = extra_pass.padded.to(device)
                 extra_lengths = extra_pass.lengths.to(device)
@@ -846,6 +891,32 @@ def print_results(all_results: dict[str, Any]) -> None:
     print(json.dumps(all_results, indent=2, sort_keys=True))
 
 
+def _default_inbetween_ckpt_for_mode(selector_mode: str) -> str:
+    mode = str(selector_mode).strip().lower().replace("-", "_")
+    if mode == "heuristic":
+        return _default_inbetween_ckpt()
+
+    preferred = [
+        os.path.join("checkpoints", f"finetuned_inbetween_{mode}_best.pt"),
+        os.path.join("checkpoints", f"composite_inbetween_{mode}_best.pt"),
+    ]
+    for path in preferred:
+        if os.path.exists(path):
+            return path
+
+    step_candidates = glob.glob(os.path.join("checkpoints", f"composite_inbetween_{mode}_step*.pt"))
+    if step_candidates:
+        def _extract_step(path: str) -> int:
+            step = _extract_step_from_path(path)
+            return -1 if step is None else int(step)
+
+        return max(step_candidates, key=_extract_step)
+
+    fallback = _default_inbetween_ckpt()
+    print(f"Warning: no mode-specific checkpoint found for selector mode '{mode}', falling back to {fallback}")
+    return fallback
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -868,9 +939,10 @@ def main() -> None:
         t2mgpt_root=t2mgpt_root,
         batch_size=args.batch_size,
         device=device,
+        num_workers=args.num_workers,
+        pin_memory=not args.no_pin_memory,
     )
 
-    include_ends = not args.no_keyframe_ends
     generators: dict[str, BaseGenerator] = {}
     if "t2mgpt" in models:
         generators["t2mgpt"] = T2MGPTGenerator(
@@ -880,23 +952,41 @@ def main() -> None:
             arlm_gpt_ckpt=args.arlm_gpt_ckpt,
             clamp_sigma=args.ar_clamp_sigma,
         )
-    if "composite" in models:
-        generators["composite"] = CompositeGenerator(
+    composite_specs = {
+        "composite_heuristic": {
+            "selector_mode": "heuristic",
+            "disable_selector": True,
+            "ckpt_override": None,
+        },
+        "composite_text_alignment": {
+            "selector_mode": "text_alignment",
+            "disable_selector": False,
+            "ckpt_override": args.composite_text_alignment_ckpt,
+        },
+        "composite_information_gain": {
+            "selector_mode": "information_gain",
+            "disable_selector": False,
+            "ckpt_override": args.composite_information_gain_ckpt,
+        },
+        "composite_retrieval_gain": {
+            "selector_mode": "retrieval_gain",
+            "disable_selector": False,
+            "ckpt_override": args.composite_retrieval_gain_ckpt,
+        },
+    }
+    for model_name, spec in composite_specs.items():
+        if model_name not in models:
+            continue
+
+        generators[model_name] = CompositeGenerator(
             humanml_root=args.humanml_root,
             t2mgpt_root=t2mgpt_root,
             device=device,
-            inbetween_ckpt=args.composite_inbetween_ckpt,
-            inbetween_steps=args.composite_inbetween_steps,
-            gpt_steps=args.composite_gpt_steps,
+            inbetween_ckpt=args.composite_inbetween_ckpt or spec["ckpt_override"],
             arlm_vq_ckpt=args.arlm_vq_ckpt,
             arlm_gpt_ckpt=args.arlm_gpt_ckpt,
-            disable_selector=args.disable_selector,
-            keyframe_strategy=args.keyframe_strategy,
-            keyframe_interval=args.keyframe_interval,
-            keyframe_count=args.keyframe_count,
-            keyframe_min=args.keyframe_min,
-            keyframe_max=args.keyframe_max,
-            include_ends=include_ends,
+            selector_mode=spec["selector_mode"],
+            disable_selector=spec["disable_selector"] or args.disable_selector,
             diff_guidance=args.diff_guidance,
             clamp_sigma=args.ar_clamp_sigma,
         )
@@ -912,18 +1002,19 @@ def main() -> None:
 
     for model_name in models:
         print(f"Running evaluation for {model_name} on {device}")
-        all_results["models"][model_name] = evaluate_model(
-            model_name=model_name,
-            generator=generators[model_name],
-            loader=loader,
-            eval_wrapper=eval_wrapper,
-            top_k=top_k,
-            metrics=metrics,
-            num_samples=args.num_samples,
-            multimodal_repeats=args.multimodal_repeats,
-            multimodal_sample_count=args.multimodal_sample_count,
-            categorical_sample=args.categorical_sample,
-        )
+        with torch.inference_mode():
+            all_results["models"][model_name] = evaluate_model(
+                model_name=model_name,
+                generator=generators[model_name],
+                loader=loader,
+                eval_wrapper=eval_wrapper,
+                top_k=top_k,
+                metrics=metrics,
+                num_samples=args.num_samples,
+                multimodal_repeats=args.multimodal_repeats,
+                multimodal_sample_count=args.multimodal_sample_count,
+                categorical_sample=args.categorical_sample,
+            )
 
     if args.save_results:
         os.makedirs(os.path.dirname(results_path), exist_ok=True)

@@ -1,7 +1,10 @@
 """Utility functions for training and evaluation."""
 
+import os
+import random
 from typing import List
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import clip
@@ -324,3 +327,153 @@ def prepare_gpt_batch(batch, vqvae, gpt, downsample_rate, device):
     target_mask = torch.cat([token_mask, torch.ones(B, 1, dtype=torch.bool, device=device)], dim=1)
 
     return input_tokens, target_tokens, target_mask
+
+
+def select_keyframe_indices(
+    length: int,
+    keyframe_interval: int,
+    strategy: str,
+    keyframe_count: int | None,
+    keyframe_min: int,
+    keyframe_max: int,
+    include_ends: bool,
+) -> list[int]:
+    if length <= 0:
+        return [0]
+
+    if strategy == 'random':
+        if keyframe_count is not None:
+            k = keyframe_count
+        else:
+            k = random.randint(keyframe_min, keyframe_max)
+
+        if include_ends:
+            k = max(k, 2)
+
+        k = max(1, min(k, length))
+
+        if include_ends and length >= 2:
+            indices = {0, length - 1}
+            remaining = [i for i in range(1, length - 1)]
+            k_remaining = max(0, k - len(indices))
+            if k_remaining > 0 and len(remaining) > 0:
+                indices.update(random.sample(remaining, min(k_remaining, len(remaining))))
+        else:
+            indices = set(random.sample(range(length), k))
+
+        return sorted(indices)
+
+    # interval strategy (default)
+    indices = list(range(0, length, keyframe_interval))
+    if indices[-1] != length - 1:
+        indices.append(length - 1)
+    return indices
+
+
+def load_inbetween_model(
+    cfg,
+    device: str = 'cuda',
+    inbetween_ckpt_path: str | None = None,
+):
+    """Load inbetween diffusion model and normalization stats from a checkpoint."""
+    from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+    from models.selectors import build_keyframe_selector
+
+    mean_path = os.path.join(cfg.root, 'Mean.npy')
+    std_path = os.path.join(cfg.root, 'Std.npy')
+    mean = torch.from_numpy(np.load(mean_path)).float().view(-1)
+    std = torch.from_numpy(np.load(std_path)).float().view(-1)
+    Fdim = mean.shape[0]
+
+    if inbetween_ckpt_path is None:
+        inbetween_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
+
+    ckpt = None
+    if os.path.exists(inbetween_ckpt_path):
+        ckpt = torch.load(inbetween_ckpt_path, map_location=device)
+
+    def _count_prefix_layers(state_dict: dict, prefix: str, index_pos: int) -> int:
+        idx = set()
+        for k in state_dict.keys():
+            if not k.startswith(prefix):
+                continue
+            parts = k.split('.')
+            if len(parts) > index_pos and parts[index_pos].isdigit():
+                idx.add(int(parts[index_pos]))
+        return (max(idx) + 1) if idx else 0
+
+    inbetween_d_model = cfg.inbetween_d_model
+    inbetween_n_layers = cfg.inbetween_layers
+    inbetween_n_heads = cfg.inbetween_heads
+
+    if isinstance(ckpt, dict):
+        saved_cfg = ckpt.get('cfg')
+        if isinstance(saved_cfg, dict):
+            inbetween_d_model = int(saved_cfg.get('inbetween_d_model', saved_cfg.get('d_model', inbetween_d_model)))
+            inbetween_n_layers = int(saved_cfg.get('inbetween_layers', saved_cfg.get('n_layers', inbetween_n_layers)))
+            inbetween_n_heads = int(saved_cfg.get('inbetween_heads', saved_cfg.get('n_heads', inbetween_n_heads)))
+
+    inbetween_state = ckpt.get('inbetween') if isinstance(ckpt, dict) else None
+    if isinstance(inbetween_state, dict):
+        if 'frame_in.weight' in inbetween_state:
+            inbetween_d_model = int(inbetween_state['frame_in.weight'].shape[0])
+        counted = _count_prefix_layers(inbetween_state, 'encoder.layers.', 2)
+        if counted > 0:
+            inbetween_n_layers = counted
+
+    inbetween_model = InbetweenTransformer(
+        feature_dim=Fdim,
+        cond_dim=512,
+        d_model=inbetween_d_model,
+        n_layers=inbetween_n_layers,
+        n_heads=inbetween_n_heads,
+        dropout=cfg.dropout,
+        max_len=cfg.max_len + 10,
+    ).to(device)
+    diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
+
+    if ckpt is not None:
+        inbetween_state_for_infer = ckpt.get('inbetween_ema', ckpt['inbetween'])
+        inbetween_model.load_state_dict(inbetween_state_for_infer)
+
+        selector_state = ckpt.get('selector_ema', ckpt.get('selector'))
+        saved_cfg = ckpt.get('cfg') if isinstance(ckpt, dict) else None
+        saved_selector_mode = cfg.selector_mode
+        saved_selector_heads = cfg.selector_heads
+        saved_selector_threshold = cfg.selector_threshold
+        saved_selector_ratio = cfg.selector_target_ratio
+        if isinstance(saved_cfg, dict):
+            saved_selector_mode = str(saved_cfg.get('selector_mode', saved_selector_mode))
+            saved_selector_heads = int(saved_cfg.get('selector_heads', saved_selector_heads))
+            saved_selector_threshold = float(saved_cfg.get('selector_threshold', saved_selector_threshold))
+            saved_selector_ratio = float(saved_cfg.get('selector_target_ratio', saved_selector_ratio))
+
+        if cfg.use_learned_keyframe_selector and selector_state is not None:
+            selector_d_model = cfg.selector_d_model
+            if isinstance(selector_state, dict) and 'frame_in.weight' in selector_state:
+                selector_d_model = int(selector_state['frame_in.weight'].shape[0])
+            selector_layers = cfg.selector_layers
+            if isinstance(selector_state, dict):
+                selector_layers = _count_prefix_layers(selector_state, 'encoder.layers.', 2) or selector_layers
+            selector_model = build_keyframe_selector(
+                mode=saved_selector_mode,
+                feature_dim=Fdim,
+                cond_dim=512,
+                d_model=selector_d_model,
+                n_layers=selector_layers,
+                n_heads=saved_selector_heads,
+                dropout=cfg.selector_dropout,
+                max_len=cfg.max_len + 10,
+                threshold=saved_selector_threshold,
+                budget_ratio=saved_selector_ratio,
+            ).to(device)
+            if isinstance(selector_state, dict) and len(selector_state) > 0:
+                selector_model.load_state_dict(selector_state, strict=False)
+            selector_model.eval()
+            inbetween_model.keyframe_selector = selector_model
+            print(f'Loaded {saved_selector_mode} keyframe selector from checkpoint (EMA if available)')
+        print(f'Loaded inbetween model from {inbetween_ckpt_path} (EMA if available)')
+
+    inbetween_model.eval()
+    clip_model = setup_clip_model(device)
+    return inbetween_model, diff_inbetween, clip_model, mean, std, Fdim

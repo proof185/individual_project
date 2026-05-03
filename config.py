@@ -4,6 +4,84 @@ from dataclasses import dataclass
 
 
 @dataclass
+class InbetweenTrainConfig:
+    # Data
+    root: str = 'humanml'
+    max_len: int = 196
+    batch_size: int = 32
+    num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+    keyframe_source_dir: str | None = None
+
+    # Optimisation
+    lr: float = 1e-4
+    inbetween_steps: int = 100_000
+    grad_clip: float = 1.0
+    grad_accum_steps: int = 4
+    scheduler_type: str = 'cosine'
+    warmup_ratio: float = 0.02
+    min_lr_ratio: float = 0.05
+    inbetween_lr: float | None = None
+    selector_lr: float | None = None
+    selector_lr_scale: float = 0.5
+    ema_decay: float = 0.999
+    use_ema_for_sampling: bool = True
+
+    # Validation
+    val_split: str = 'val'
+    val_batch_size: int = 32
+    val_interval: int = 1000
+    val_batches: int = 10
+
+    # Conditioning/keyframes
+    keyframe_interval: int = 5
+    keyframe_strategy: str = 'random'
+    keyframe_count: int | None = None
+    keyframe_min: int = 3
+    keyframe_max: int = 20
+    keyframe_include_ends: bool = True
+
+    # Loss weights
+    inbetween_velocity_weight: float = 0.75
+    boundary_velocity_weight: float = 1.0
+    boundary_acceleration_weight: float = 0.25
+    boundary_jerk_weight: float = 0.1
+    transition_consistency_weight: float = 0.75
+    transition_window: int = 4
+    transition_sigma: float = 1.5
+    transition_velocity_weight: float = 1.0
+    transition_acceleration_weight: float = 0.5
+
+    # Selector
+    use_learned_keyframe_selector: bool = True
+    selector_mode: str = 'text_alignment'
+    selector_d_model: int = 256
+    selector_layers: int = 4
+    selector_heads: int = 4
+    selector_dropout: float = 0.1
+    selector_threshold: float = 0.5
+    selector_target_ratio: float = 0.1
+    selector_budget_weight: float = 5.0
+    selector_entropy_weight: float = 0.02
+    selector_aux_weight: float = 0.5
+    selector_curriculum_fraction: float = 0.0
+    selector_oracle_ckpt_path: str | None = None
+    selector_oracle_timesteps: int = 3
+    selector_eval_root: str | None = None
+    selector_retrieval_negatives: int = 31
+
+    # Diffusion/model
+    T_diffusion: int = 1000
+    p_uncond: float = 0.1
+    dropout: float = 0.1
+    inbetween_d_model: int = 512
+    inbetween_layers: int = 12
+    inbetween_heads: int = 8
+
+
+@dataclass
 class CompositeConfig:
     root: str = 'humanml'
     split: str = 'train'
