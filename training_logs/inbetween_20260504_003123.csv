@@ -1,0 +1,1 @@
+step,total_loss,val_loss,lr_inbetween,lr_selector,selector_budget_weight,selector_entropy_weight,selector_aux_weight,selector_ratio,selector_budget,selector_entropy,selector_aux

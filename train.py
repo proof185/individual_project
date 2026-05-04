@@ -1200,6 +1200,7 @@ def main(
         mean=mean,
         std=std,
         device=device,
+        load_token_embeddings=False,
     )
     
     print('Dataset size:', len(dataset))
@@ -1225,6 +1226,7 @@ def main(
             mean=mean,
             std=std,
             device=device,
+            load_token_embeddings=False,
         )
         val_loader_kwargs = {
             'batch_size': min(cfg.val_batch_size, cfg.batch_size),
@@ -1408,6 +1410,14 @@ def train_inbetween(
             f"Ignoring existing final checkpoint {inbetween_final_ckpt_path} because explicit resume was requested: {resume_ckpt_path}"
         )
 
+    selector_only_training = bool(
+        getattr(cfg, 'freeze_inbetween_for_selector', False)
+        and keyframe_selector is not None
+    )
+    if selector_only_training:
+        for param in inbetween_model.parameters():
+            param.requires_grad = False
+
     inbetween_lr = float(cfg.inbetween_lr if cfg.inbetween_lr is not None else cfg.lr)
     selector_has_trainable_params = False
     selector_params = []
@@ -1415,18 +1425,27 @@ def train_inbetween(
         selector_params = [p for p in keyframe_selector.parameters() if p.requires_grad]
         selector_has_trainable_params = len(selector_params) > 0 and getattr(keyframe_selector, 'is_trainable', True)
 
-    if selector_has_trainable_params:
+    if selector_only_training and selector_has_trainable_params:
+        selector_lr = float(cfg.selector_lr if cfg.selector_lr is not None else (inbetween_lr * cfg.selector_lr_scale))
+        param_groups = [
+            {'params': selector_params, 'lr': selector_lr, 'name': 'selector'},
+        ]
+        base_lrs = [selector_lr]
+    elif selector_has_trainable_params:
         selector_lr = float(cfg.selector_lr if cfg.selector_lr is not None else (inbetween_lr * cfg.selector_lr_scale))
         param_groups = [
             {'params': list(inbetween_model.parameters()), 'lr': inbetween_lr, 'name': 'inbetween'},
             {'params': selector_params, 'lr': selector_lr, 'name': 'selector'},
         ]
         base_lrs = [inbetween_lr, selector_lr]
+    elif selector_only_training:
+        param_groups = []
+        base_lrs = []
     else:
         param_groups = [{'params': list(inbetween_model.parameters()), 'lr': inbetween_lr, 'name': 'inbetween'}]
         base_lrs = [inbetween_lr]
 
-    inbetween_optimizer = torch.optim.AdamW(param_groups)
+    inbetween_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
     all_params = []
     for group in param_groups:
         all_params.extend(group['params'])
@@ -1467,13 +1486,17 @@ def train_inbetween(
                     ema_selector_state = {k: v.detach().clone() for k, v in inbetween_ckpt['selector_ema'].items()}
             else:
                 print('Warning: resume checkpoint has no selector state; selector will train from scratch.')
-        if 'optimizer' in inbetween_ckpt:
+        if inbetween_optimizer is not None and 'optimizer' in inbetween_ckpt and not selector_only_training:
             try:
                 inbetween_optimizer.load_state_dict(inbetween_ckpt['optimizer'])
             except Exception as exc:
                 print(f"Warning: failed to load optimizer state, continuing with fresh optimizer ({exc})")
-        start_step = int(inbetween_ckpt.get('step', 0))
-        print(f"Resume step: {start_step}")
+        if selector_only_training:
+            print('Selector-only training: using resumed diffusion weights as a frozen base and resetting the optimizer step counter.')
+            start_step = 0
+        else:
+            start_step = int(inbetween_ckpt.get('step', 0))
+            print(f"Resume step: {start_step}")
         if cfg.inbetween_steps <= start_step:
             print("Requested in-betweening steps already reached; nothing to train.")
             return
@@ -1489,9 +1512,35 @@ def train_inbetween(
         except Exception as exc:
             print(f"Warning: failed to read best checkpoint metadata ({exc})")
 
-    inbetween_model.train()
+    if selector_only_training:
+        inbetween_model.eval()
+    else:
+        inbetween_model.train()
     if keyframe_selector is not None:
-        keyframe_selector.train()
+        if selector_has_trainable_params:
+            keyframe_selector.train()
+        else:
+            keyframe_selector.eval()
+
+    if selector_only_training and not selector_has_trainable_params:
+        print('Selector mode has no trainable parameters; saving a selector-wrapped checkpoint around the frozen base diffusion model.')
+        os.makedirs('checkpoints', exist_ok=True)
+        checkpoint_payload = {
+            'inbetween': inbetween_model.state_dict(),
+            'inbetween_ema': ema_inbetween_state,
+            'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
+            'selector_ema': None,
+            'optimizer': None,
+            'step': cfg.inbetween_steps,
+            'best_step': 0,
+            'best_val_loss': float('inf'),
+            'cfg': cfg.__dict__,
+        }
+        torch.save(checkpoint_payload, inbetween_final_ckpt_path)
+        torch.save(checkpoint_payload, inbetween_best_ckpt_path)
+        print(f'Saved selector checkpoint: {inbetween_final_ckpt_path}')
+        return
+
     data_iter = cycle(loader)
     grad_accum_steps = max(1, int(cfg.grad_accum_steps))
     
@@ -1501,21 +1550,32 @@ def train_inbetween(
             f"(target ratio={cfg.selector_target_ratio})..."
         )
     else:
-        print(f"Stage 2: Training Diffusion In-Betweening (keyframe interval={cfg.keyframe_interval})...")
+        if cfg.keyframe_strategy == 'random':
+            print(
+                "Stage 2: Training Diffusion In-Betweening "
+                f"(dataset fallback keyframes=random, min={cfg.keyframe_min}, max={cfg.keyframe_max}, "
+                f"include_ends={cfg.keyframe_include_ends})..."
+            )
+        else:
+            print(
+                "Stage 2: Training Diffusion In-Betweening "
+                f"(dataset fallback keyframes=interval, interval={cfg.keyframe_interval})..."
+            )
     
     start_time = time.time()
 
     for step in range(start_step + 1, cfg.inbetween_steps + 1):
-        _apply_lr_schedule(
-            inbetween_optimizer,
-            base_lrs,
-            step,
-            cfg.inbetween_steps,
-            cfg.warmup_ratio,
-            cfg.min_lr_ratio,
-            cfg.scheduler_type,
-        )
-        inbetween_optimizer.zero_grad(set_to_none=True)
+        if inbetween_optimizer is not None:
+            _apply_lr_schedule(
+                inbetween_optimizer,
+                base_lrs,
+                step,
+                cfg.inbetween_steps,
+                cfg.warmup_ratio,
+                cfg.min_lr_ratio,
+                cfg.scheduler_type,
+            )
+            inbetween_optimizer.zero_grad(set_to_none=True)
 
         if keyframe_selector is not None:
             curriculum_den = max(1.0, float(cfg.inbetween_steps) * float(cfg.selector_curriculum_fraction))
@@ -1570,8 +1630,10 @@ def train_inbetween(
                 selector_entropy_running += out['selector_entropy'].item()
                 selector_aux_running += out['selector_aux'].item()
 
-        nn.utils.clip_grad_norm_(all_params, cfg.grad_clip)
-        inbetween_optimizer.step()
+        if all_params:
+            nn.utils.clip_grad_norm_(all_params, cfg.grad_clip)
+        if inbetween_optimizer is not None:
+            inbetween_optimizer.step()
 
         total_loss_avg = total_loss_running / grad_accum_steps
         selector_ratio_avg = None
@@ -1640,13 +1702,19 @@ def train_inbetween(
             eta_hours = int(eta_seconds // 3600)
             eta_minutes = int((eta_seconds % 3600) // 60)
 
-            lr_inbetween = inbetween_optimizer.param_groups[0]['lr']
-            lr_selector = inbetween_optimizer.param_groups[1]['lr'] if len(inbetween_optimizer.param_groups) > 1 else None
+            lr_inbetween = None
+            lr_selector = None
+            if inbetween_optimizer is not None:
+                if selector_only_training:
+                    lr_selector = inbetween_optimizer.param_groups[0]['lr']
+                else:
+                    lr_inbetween = inbetween_optimizer.param_groups[0]['lr']
+                    lr_selector = inbetween_optimizer.param_groups[1]['lr'] if len(inbetween_optimizer.param_groups) > 1 else None
 
             if selector_ratio_avg is None:
                 print(
                     f"step {step:>7d} | loss {total_loss_avg:.5f} | "
-                    f"lr {lr_inbetween:.2e} | "
+                    f"lr {(lr_selector if selector_only_training else lr_inbetween):.2e} | "
                     f"val {val_loss if val_loss is not None else float('nan'):.5f} | "
                     f"ETA: {eta_hours}h {eta_minutes}m"
                 )
@@ -1657,7 +1725,7 @@ def train_inbetween(
                     f"sel_budget {selector_budget_avg:.5f} | "
                     f"sel_entropy {selector_entropy_avg:.5f} | "
                     f"sel_aux {selector_aux_avg:.5f} | "
-                    f"lr_d {lr_inbetween:.2e} | "
+                    f"lr_d {(lr_inbetween if lr_inbetween is not None else float('nan')):.2e} | "
                     f"lr_s {lr_selector if lr_selector is not None else float('nan'):.2e} | "
                     f"val {val_loss if val_loss is not None else float('nan'):.5f} | "
                     f"ETA: {eta_hours}h {eta_minutes}m"

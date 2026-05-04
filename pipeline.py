@@ -4,6 +4,7 @@ This wraps the existing scripts behind one intuitive command surface.
 """
 
 import argparse
+import glob
 import os
 import re
 import subprocess
@@ -64,6 +65,27 @@ def _quote_py_string(value: str) -> str:
     return repr(value)
 
 
+def _checkpoint_candidates(root: str, ckpt_prefix: str) -> List[str]:
+    checkpoints_dir = os.path.join(root, "checkpoints")
+    candidates = [os.path.join(checkpoints_dir, f"{ckpt_prefix}_best.pt")]
+    step_paths = glob.glob(os.path.join(checkpoints_dir, f"{ckpt_prefix}_step*.pt"))
+
+    def _extract_step(path: str) -> int:
+        match = re.search(r"_step(\d+)\.pt$", os.path.basename(path))
+        return int(match.group(1)) if match else -1
+
+    step_paths.sort(key=_extract_step, reverse=True)
+    candidates.extend(step_paths)
+    return candidates
+
+
+def _resolve_existing_checkpoint(root: str, ckpt_prefix: str) -> str | None:
+    for path in _checkpoint_candidates(root, ckpt_prefix):
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _run_train_selectors_all(args: argparse.Namespace) -> None:
     root = _project_root()
     config_path = os.path.join(root, "config.py")
@@ -79,6 +101,7 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
             "selector_mode": "text_alignment",
             "ckpt_prefix": "composite_inbetween_heuristic",
             "uses_oracle": False,
+            "resume_from_bootstrap": False,
         },
         {
             "name": "text_alignment",
@@ -86,6 +109,7 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
             "selector_mode": "text_alignment",
             "ckpt_prefix": "composite_inbetween_text_alignment",
             "uses_oracle": False,
+            "resume_from_bootstrap": True,
         },
         {
             "name": "saliency",
@@ -93,6 +117,7 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
             "selector_mode": "saliency",
             "ckpt_prefix": "composite_inbetween_saliency",
             "uses_oracle": False,
+            "resume_from_bootstrap": True,
         },
         {
             "name": "information_gain",
@@ -100,6 +125,7 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
             "selector_mode": "information_gain",
             "ckpt_prefix": "composite_inbetween_information_gain",
             "uses_oracle": True,
+            "resume_from_bootstrap": True,
         },
         {
             "name": "retrieval_gain",
@@ -107,6 +133,7 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
             "selector_mode": "retrieval_gain",
             "ckpt_prefix": "composite_inbetween_retrieval_gain",
             "uses_oracle": True,
+            "resume_from_bootstrap": True,
         },
     ]
 
@@ -129,17 +156,45 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
     if oracle_override:
         oracle_override = os.path.abspath(os.path.join(root, oracle_override))
 
+    bootstrap_oracle_path = oracle_override
+    bootstrap_oracle_prefix = "composite_inbetween_heuristic"
+    if bootstrap_oracle_path is None:
+        bootstrap_oracle_path = _resolve_existing_checkpoint(root, bootstrap_oracle_prefix)
+
+    needs_oracle = any(item["uses_oracle"] for item in train_plan)
+    has_bootstrap_run = any(item["ckpt_prefix"] == bootstrap_oracle_prefix for item in train_plan)
+    needs_bootstrap = any(item["resume_from_bootstrap"] for item in train_plan)
+    if needs_bootstrap and bootstrap_oracle_path is None and not has_bootstrap_run:
+        train_plan = [
+            {
+                "name": "heuristic",
+                "selector_enabled": False,
+                "selector_mode": "text_alignment",
+                "ckpt_prefix": bootstrap_oracle_prefix,
+                "uses_oracle": False,
+                "resume_from_bootstrap": False,
+            },
+            *train_plan,
+        ]
+        print("Inserted heuristic bootstrap run so selector strategies can train around a single shared diffusion base.")
+
     try:
         for idx, run_cfg in enumerate(train_plan, start=1):
             print(f"\n[{idx}/{len(train_plan)}] Preparing {run_cfg['name']} training run")
 
             selector_oracle_ckpt_value = "None"
-            if run_cfg["uses_oracle"] and oracle_override:
-                selector_oracle_ckpt_value = _quote_py_string(oracle_override)
+            if run_cfg["uses_oracle"]:
+                if bootstrap_oracle_path is None:
+                    raise FileNotFoundError(
+                        "Oracle-backed selector modes require a bootstrap checkpoint, but none was available. "
+                        "Run text_alignment first or pass --oracle-ckpt explicitly."
+                    )
+                selector_oracle_ckpt_value = _quote_py_string(bootstrap_oracle_path)
 
             updated_config = _set_inbetween_config_fields(
                 original_config,
                 {
+                    "freeze_inbetween_for_selector": "True" if run_cfg["resume_from_bootstrap"] else "False",
                     "use_learned_keyframe_selector": "True" if run_cfg["selector_enabled"] else "False",
                     "selector_mode": _quote_py_string(run_cfg["selector_mode"]),
                     "selector_oracle_ckpt_path": selector_oracle_ckpt_value,
@@ -148,10 +203,25 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
             _write_file(config_path, updated_config)
 
             script_args: List[str] = ["--inbetween-ckpt-prefix", run_cfg["ckpt_prefix"]]
+            if run_cfg["resume_from_bootstrap"]:
+                if bootstrap_oracle_path is None:
+                    raise FileNotFoundError(
+                        "Selector strategy training requires the shared heuristic diffusion checkpoint, but it was not found."
+                    )
+                script_args.extend(["--inbetween-resume", bootstrap_oracle_path])
             if args.force:
                 script_args.insert(0, "--force")
 
             _run("train.py", script_args)
+
+            if run_cfg["ckpt_prefix"] == bootstrap_oracle_prefix and oracle_override is None:
+                discovered = _resolve_existing_checkpoint(root, bootstrap_oracle_prefix)
+                if discovered is None:
+                    raise FileNotFoundError(
+                        "Bootstrap training completed but no checkpoint was found to bootstrap oracle-backed selector modes."
+                    )
+                bootstrap_oracle_path = discovered
+                print(f"Using heuristic random-keyframe checkpoint as oracle bootstrap: {bootstrap_oracle_path}")
 
     finally:
         if args.keep_config:

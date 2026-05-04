@@ -1,0 +1,31 @@
+{
+  "prompt": "a person does a spinning kick and lands smoothly",
+  "length_native_ar": 144,
+  "length_generated": 144,
+  "feature_dim": 263,
+  "ar_model": "t2m-gpt",
+  "ar_motion_path": "D:\\Projects\\individual_project\\samples\\sample_heuristic_ar_motion.npy",
+  "ar_motion_native_norm_path": "D:\\Projects\\individual_project\\samples\\sample_heuristic_ar_motion_native_norm.npy",
+  "ar_motion_local_norm_path": "D:\\Projects\\individual_project\\samples\\sample_heuristic_ar_motion_local_norm.npy",
+  "inbetween_ckpt": "D:\\Projects\\individual_project\\checkpoints\\composite_inbetween_heuristic_best.pt",
+  "t2mgpt_root": "D:\\Projects\\T2M-GPT",
+  "t2mgpt_vq_ckpt": "D:\\Projects\\T2M-GPT\\pretrained\\VQVAE\\net_last.pth",
+  "t2mgpt_gpt_ckpt": "D:\\Projects\\T2M-GPT\\pretrained\\VQTransformer_corruption05\\net_best_fid.pth",
+  "t2mgpt_meta_dir": "D:\\Projects\\T2M-GPT\\checkpoints\\t2m\\VQVAEV3_CB1024_CMT_H1024_NRES3\\meta",
+  "device": "cuda",
+  "used_selector": false,
+  "selector_fallback_used": false,
+  "keyframe_count": 10,
+  "keyframe_indices": [
+    0,
+    26,
+    36,
+    44,
+    46,
+    50,
+    107,
+    108,
+    129,
+    143
+  ]
+}

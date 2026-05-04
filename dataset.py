@@ -29,6 +29,7 @@ class HUMANML3DCompositeDataset(Dataset):
         mean: Optional[torch.Tensor] = None,
         std: Optional[torch.Tensor] = None,
         device: str = 'cuda',
+        load_token_embeddings: bool = False,
     ):
         self.root = root
         self.split = split
@@ -44,6 +45,7 @@ class HUMANML3DCompositeDataset(Dataset):
         self.include_keyframes = include_keyframes
         self.conditioning_motion_dir = conditioning_motion_dir
         self.device = device
+        self.load_token_embeddings = load_token_embeddings
 
         # Load mean and std if provided
         if mean is not None and std is not None:
@@ -104,7 +106,7 @@ class HUMANML3DCompositeDataset(Dataset):
                 cpu_cache = {k: v.cpu() for k, v in self.embeddings.items()}
                 torch.save(cpu_cache, self.emb_cache_path)
 
-        if text_encoder is not None and hasattr(text_encoder, 'encode_with_tokens'):
+        if self.load_token_embeddings and text_encoder is not None and hasattr(text_encoder, 'encode_with_tokens'):
             if use_cache and os.path.exists(self.token_emb_cache_path):
                 print(f'Loading cached token-level CLIP embeddings from {self.token_emb_cache_path}')
                 cpu_cache = torch.load(self.token_emb_cache_path)

@@ -1,0 +1,4 @@
+step,total_loss,val_loss,lr_inbetween,lr_selector,selector_budget_weight,selector_entropy_weight,selector_aux_weight,selector_ratio,selector_budget,selector_entropy,selector_aux
+200,0.852546215057373,,1.3333333333333333e-05,,5.0,0.02,0.5,,,,
+400,0.6010360717773438,,2.6666666666666667e-05,,5.0,0.02,0.5,,,,
+600,0.381897896528244,,4e-05,,5.0,0.02,0.5,,,,

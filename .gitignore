@@ -25,5 +25,5 @@ sample_composite_*.npy
 
 # Model checkpoints
 checkpoints/
-
+old_checkpoints/
 TRAIN_ALL_GEN/
