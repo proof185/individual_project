@@ -56,7 +56,7 @@ class InbetweenTrainConfig:
 
     # Selector
     use_learned_keyframe_selector: bool = False
-    selector_mode: str = 'text_alignment'
+    selector_mode: str = 'reconstruction'
     selector_d_model: int = 256
     selector_layers: int = 4
     selector_heads: int = 4
@@ -65,14 +65,11 @@ class InbetweenTrainConfig:
     selector_target_ratio: float = 0.2
     selector_budget_weight: float = 5.0
     selector_entropy_weight: float = 0.02
-    selector_aux_weight: float = 0.5
+    selector_aux_weight: float = 1.0
     selector_curriculum_fraction: float = 0.3
     freeze_inbetween_for_selector: bool = False
-    selector_oracle_ckpt_path: str | None = None
     external_inbetween_ckpt_path: str | None = None
-    selector_oracle_timesteps: int = 3
-    selector_eval_root: str | None = None
-    selector_retrieval_negatives: int = 31
+    selector_reconstruction_timesteps: int = 3
 
     # Diffusion/model
     T_diffusion: int = 1000
@@ -84,7 +81,7 @@ class InbetweenTrainConfig:
 
 
 @dataclass
-class SelectorTrainConfig:
+class ReconstructionTrainConfig:
     # Data
     root: str = 'humanml'
     max_len: int = 196
@@ -115,7 +112,7 @@ class SelectorTrainConfig:
     keyframe_strategy: str = 'random'
 
     # Selector
-    selector_mode: str = 'text_alignment'
+    selector_mode: str = 'reconstruction'
     selector_d_model: int = 256
     selector_layers: int = 4
     selector_heads: int = 4
@@ -124,13 +121,11 @@ class SelectorTrainConfig:
     selector_target_ratio: float = 0.2
     selector_budget_weight: float = 5.0
     selector_entropy_weight: float = 0.02
-    selector_aux_weight: float = 0.5
+    selector_aux_weight: float = 1.0
     selector_curriculum_fraction: float = 0.3
-    selector_oracle_ckpt_path: str | None = None
-    external_inbetween_ckpt_path: str = 'D:\Projects\diffusion-motion-inbetweening\save\condmdi_randomframes\model000750000.pt'
-    selector_oracle_timesteps: int = 3
-    selector_eval_root: str | None = None
-    selector_retrieval_negatives: int = 31
+    external_inbetween_ckpt_path: str = '../diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt'
+    selector_reconstruction_timesteps: int = 3
+    T_diffusion: int = 1000
 
     # Conditioning
     p_uncond: float = 0.1
@@ -194,7 +189,7 @@ class CompositeConfig:
 
     # Learnable keyframe selector (upstream mask generator)
     use_learned_keyframe_selector: bool = True
-    selector_mode: str = 'text_alignment'
+    selector_mode: str = 'reconstruction'
     selector_d_model: int = 256
     selector_layers: int = 4
     selector_heads: int = 4
@@ -203,13 +198,10 @@ class CompositeConfig:
     selector_target_ratio: float = 0.2
     selector_budget_weight: float = 5.0
     selector_entropy_weight: float = 0.02
-    selector_aux_weight: float = 0.5
+    selector_aux_weight: float = 1.0
     selector_curriculum_fraction: float = 0.3
-    selector_oracle_ckpt_path: str | None = None
     external_inbetween_ckpt_path: str | None = None
-    selector_oracle_timesteps: int = 3
-    selector_eval_root: str | None = None
-    selector_retrieval_negatives: int = 31
+    selector_reconstruction_timesteps: int = 3
 
     # VQ-VAE
     codebook_size: int = 512   # Larger codebook for richer motion vocabulary

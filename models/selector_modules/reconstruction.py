@@ -8,7 +8,9 @@ import torch.nn as nn
 from .common import BaseKeyframeSelector, _budget_topk_straight_through
 
 
-class InformationGainKeyframeSelector(BaseKeyframeSelector):
+class ReconstructionKeyframeSelector(BaseKeyframeSelector):
+    """Trainable selector whose supervision comes from CondMDI reconstruction loss."""
+
     def __init__(
         self,
         feature_dim: int,
@@ -19,7 +21,7 @@ class InformationGainKeyframeSelector(BaseKeyframeSelector):
         dropout: float = 0.1,
         max_len: int = 256,
         threshold: float = 0.5,
-        budget_ratio: float = 0.1,
+        budget_ratio: float = 0.2,
         **_: object,
     ):
         super().__init__(threshold=threshold, budget_ratio=budget_ratio)
@@ -59,19 +61,4 @@ class InformationGainKeyframeSelector(BaseKeyframeSelector):
             h = h + self.cond_mlp(cond).unsqueeze(1)
         h = self.encoder(h, src_key_padding_mask=~valid_mask)
         probs = torch.sigmoid(self.out(h).squeeze(-1)) * valid_mask.float()
-        return _budget_topk_straight_through(probs, valid_mask, self.budget_ratio or 0.1)
-
-    def compute_auxiliary_loss(
-        self,
-        motion: torch.Tensor,
-        valid_mask: torch.Tensor,
-        cond: Optional[torch.Tensor],
-        probs: torch.Tensor,
-        st_mask: torch.Tensor,
-        oracle_target: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        del motion, cond, st_mask
-        if oracle_target is None:
-            return torch.zeros((), device=probs.device)
-        target = oracle_target * valid_mask.float()
-        return ((probs - target) ** 2 * valid_mask.float()).sum() / valid_mask.float().sum().clamp(min=1.0)
+        return _budget_topk_straight_through(probs, valid_mask, self.budget_ratio or 0.2)

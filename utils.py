@@ -378,7 +378,7 @@ def load_inbetween_model(
     inbetween_ckpt_path: str | None = None,
 ):
     """Load external CondMDI runtime and normalization stats from a checkpoint."""
-    from models.selectors import build_keyframe_selector
+    from models.selector_modules import build_keyframe_selector
 
     mean_path = os.path.join(cfg.root, 'Mean.npy')
     std_path = os.path.join(cfg.root, 'Std.npy')

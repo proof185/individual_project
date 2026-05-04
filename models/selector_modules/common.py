@@ -8,9 +8,7 @@ import torch.nn.functional as F
 
 
 SELECTOR_MODE_CHOICES = (
-    'information_gain',
-    'retrieval_gain',
-    'text_alignment',
+    'reconstruction',
     'saliency',
 )
 
@@ -228,7 +226,6 @@ class BaseKeyframeSelector(nn.Module):
         cond: Optional[torch.Tensor],
         probs: torch.Tensor,
         st_mask: torch.Tensor,
-        oracle_target: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del motion, valid_mask, cond, st_mask, oracle_target
+        del motion, valid_mask, cond, st_mask
         return torch.zeros((), device=probs.device)

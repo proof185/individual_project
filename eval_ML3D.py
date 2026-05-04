@@ -48,8 +48,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Comma-separated models: all, t2mgpt, gpt, composite, "
-            "composite_heuristic, composite_text_alignment, "
-            "composite_information_gain, composite_retrieval_gain"
+            "composite_heuristic, composite_reconstruction"
         ),
     )
     parser.add_argument(
@@ -136,22 +135,10 @@ def parse_args() -> argparse.Namespace:
         help="Explicit checkpoint override for all composite selector variants",
     )
     parser.add_argument(
-        "--composite-text-alignment-ckpt",
+        "--composite-reconstruction-ckpt",
         type=str,
         default=None,
-        help="Checkpoint override for composite_text_alignment",
-    )
-    parser.add_argument(
-        "--composite-information-gain-ckpt",
-        type=str,
-        default=None,
-        help="Checkpoint override for composite_information_gain",
-    )
-    parser.add_argument(
-        "--composite-retrieval-gain-ckpt",
-        type=str,
-        default=None,
-        help="Checkpoint override for composite_retrieval_gain",
+        help="Checkpoint override for composite_reconstruction",
     )
     parser.add_argument(
         "--composite-inbetween-steps",
@@ -221,9 +208,7 @@ def parse_csv(value: str) -> list[str]:
 def resolve_models(value: str) -> list[str]:
     composite_variants = [
         "composite_heuristic",
-        "composite_text_alignment",
-        "composite_information_gain",
-        "composite_retrieval_gain",
+        "composite_reconstruction",
     ]
     requested = []
     for model_name in parse_csv(value.lower()):
@@ -960,20 +945,10 @@ def main() -> None:
             "disable_selector": True,
             "ckpt_override": None,
         },
-        "composite_text_alignment": {
-            "selector_mode": "text_alignment",
+        "composite_reconstruction": {
+            "selector_mode": "reconstruction",
             "disable_selector": False,
-            "ckpt_override": args.composite_text_alignment_ckpt,
-        },
-        "composite_information_gain": {
-            "selector_mode": "information_gain",
-            "disable_selector": False,
-            "ckpt_override": args.composite_information_gain_ckpt,
-        },
-        "composite_retrieval_gain": {
-            "selector_mode": "retrieval_gain",
-            "disable_selector": False,
-            "ckpt_override": args.composite_retrieval_gain_ckpt,
+            "ckpt_override": args.composite_reconstruction_ckpt,
         },
     }
     for model_name, spec in composite_specs.items():

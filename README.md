@@ -1,263 +1,154 @@
-# In-Between Motion Refinement (T2M-GPT + Diffusion)
+# Individual Project: Motion In-Betweening + Selector Training
 
-This repository now focuses on a single training target:
+This repository contains the local training/evaluation glue around:
 
-- diffusion in-betweening with optional learned keyframe selection
+- external T2M-GPT for AR motion generation
+- external CondMDI checkpoints for reconstruction-based selector training
+- local selector/baseline utilities for sparse keyframe conditioning
 
-AR motion generation is handled by external T2M-GPT checkpoints. This repo uses those generated motions as conditioning input and refines them with the in-between diffusion model.
+## Current Status (May 2026)
+
+The README previously described a broader end-to-end pipeline than what exists in this checkout.
+This version documents the code exactly as it is now.
+
+### What currently works in this repo
+
+- reconstruction selector training via `train_reconstruction.py`
+- reconstruction selector command via `pipeline.py train-reconstruction`
+- motion visualization via `visualize.py` / `pipeline.py visualize`
+
+### What is currently incomplete or externally required
+
+- `pipeline.py train` has been removed from the CLI
+- `run_full_sample.py` and `eval_ML3D.py` import `arlm_generate` symbols, but `arlm_generate.py` is not present in this checkout
+- `pipeline.py arlm-generate` and `pipeline.py finetune` reference scripts that are not present locally
+
+If you plan to use sample generation/evaluation from this repo directly, restore the missing scripts or vendor those imports from your external codebase first.
 
 ## Entry Point
-
-Use the unified CLI:
 
 ```bash
 python pipeline.py <command> [options]
 ```
 
-## Current Pipeline
+## Command Reference
 
-```text
-Text prompt
-  -> T2M-GPT (external pretrained AR model)
-  -> coarse HumanML3D motion features (263-d)
-  -> keyframe selection (heuristic or learned selector)
-  -> diffusion in-betweening refinement
-  -> final refined motion + visualization
-```
+### `train-reconstruction`
 
-## Quick Start
-
-### 1) Train in-between diffusion
+Trains the single learned reconstruction selector against a fixed external CondMDI checkpoint.
 
 ```bash
-python pipeline.py train
-```
-
-Train all selector variants in one command (heuristic, text_alignment, saliency, information_gain, retrieval_gain):
-
-```bash
-python pipeline.py train-selectors-all --force
-```
-
-Resume training from a checkpoint:
-
-```bash
-python pipeline.py train --inbetween-resume checkpoints/composite_inbetween_best.pt
-```
-
-### 2) Generate one full sample + visualization
-
-```bash
-python pipeline.py sample \
-  --prompt "a person walks forward then jumps and waves" \
-  --out-name demo
-```
-
-### 3) Evaluate models/selector variants
-
-```bash
-python pipeline.py evaluate --models all
-```
-
-### 4) Visualize a saved motion file
-
-```bash
-python pipeline.py visualize samples/demo_motion.npy
-```
-
-## Commands
-
-### train
-
-Runs in-between training via `train.py`.
-
-```bash
-python pipeline.py train
-python pipeline.py train --inbetween-resume checkpoints/composite_inbetween_step100000.pt
+python pipeline.py train-reconstruction --force
+python pipeline.py train-reconstruction --resume checkpoints/composite_selector_reconstruction_best.pt
 ```
 
 Useful flags:
 
 - `--force`
-- `--inbetween-resume`
-- `--inbetween-ckpt-prefix`
+- `--resume`
+- `--condmdi-ckpt`
+- `--device`
 
-### train-selectors-all
+- The reconstruction selector requires a CondMDI checkpoint at:
+  `../diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt`
+- Override it with `--condmdi-ckpt` or `ReconstructionTrainConfig.external_inbetween_ckpt_path`.
 
-Runs sequential training for all supported selector variants by temporarily patching `InbetweenTrainConfig` in `config.py` for each run and restoring the original config afterward.
+### `visualize`
 
-```bash
-python pipeline.py train-selectors-all --force
-python pipeline.py train-selectors-all --only text_alignment,saliency
-```
-
-For `information_gain` and `retrieval_gain`, `train-selectors-all` now always points `selector_oracle_ckpt_path` at the sibling CondMDI checkpoint:
-
-```text
-../diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt
-```
-
-The shared diffusion base used for resumed selector training is still the local heuristic checkpoint.
-
-Useful flags:
-
-- `--force`
-- `--only`
-- `--keep-config`
-
-### sample
-
-Runs full sample generation via `run_full_sample.py`.
+Visualizes an existing motion `.npy` file.
 
 ```bash
-python pipeline.py sample --prompt "a person walks forward"
-python pipeline.py sample --prompt "a person walks forward" --inbetween-ckpt ../diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt
+python pipeline.py visualize samples/example_motion.npy
 ```
 
-Useful flags:
+Common options:
 
-- `--inbetween-ckpt`
-- `--t2mgpt-root`
-- `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
-- `--out-dir`, `--out-name`
-- `--device`, `--stride`, `--interval-ms`
+- `--normalized`
+- `--mean-path`
+- `--std-path`
+- `--interval-ms`
+- `--save-mp4`
 
-If `--inbetween-ckpt` points to a real CondMDI checkpoint such as `diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt`, `individual_project` will now route in-between sampling through the external CondMDI repo instead of the local reimplementation.
+### `sample` (depends on missing local module)
 
-Current scope:
-
-- external CondMDI is wired for inference-time sampling and evaluation paths
-- local selector training remains unchanged
-- when using an external CondMDI checkpoint, no learned selector is loaded from that checkpoint, so keyframe selection falls back to the heuristic path unless you add a selector separately
-
-### arlm-generate
-
-Generates ARLM HumanML3D feature motions only (no training side effects).
+Routes to `run_full_sample.py`.
 
 ```bash
-python pipeline.py arlm-generate --t2mgpt-root D:/Projects/T2M-GPT
+python pipeline.py sample --prompt "a person walks forward" --out-name demo
 ```
 
-Useful flags:
+Current caveat: `run_full_sample.py` imports `ARLMConfig` / `_load_arlm_models` from `arlm_generate`, which is not present in this repository tree.
 
-- `--humanml-root`
-- `--split`
-- `--output-dir`
-- `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
+### `evaluate` (depends on missing local module)
 
-### finetune (legacy helper)
-
-Converts legacy `*_pred.npy` samples (for example from `TRAIN_ALL_GEN`) to HumanML3D feature format and launches resumed training.
+Routes to `eval_ML3D.py`.
 
 ```bash
-python pipeline.py finetune \
-  --sample-dir TRAIN_ALL_GEN \
-  --resume-ckpt checkpoints/composite_inbetween_best.pt
-```
-
-If you already generate ARLM conditioning via `arlm-generate`, this helper is usually unnecessary.
-
-### evaluate
-
-Runs HumanML3D evaluation via `eval_ML3D.py`.
-
-```bash
-python pipeline.py evaluate --models all
-python pipeline.py evaluate --models t2mgpt
 python pipeline.py evaluate --models composite
 ```
 
-`--models composite` expands to all composite selector variants:
+Current caveat: `eval_ML3D.py` imports `ARLMConfig` / `_load_arlm_models` from `arlm_generate`, which is not present in this repository tree.
 
-- `composite_heuristic`
-- `composite_text_alignment`
-- `composite_information_gain`
-- `composite_retrieval_gain`
+### `train` (removed)
 
-Useful flags exposed in `pipeline.py`:
+The `train` subcommand is no longer exposed by `pipeline.py`.
 
-- `--metrics`
-- `--device`
-- `--humanml-root`, `--t2mgpt-root`
-- `--composite-inbetween-ckpt`
-- `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
-- `--results-dir`, `--results-path`
-- `--load-results`, `--save-results`
+### `arlm-generate` and `finetune` (script targets missing)
 
-### visualize
+These commands are still declared in `pipeline.py`, but their target scripts are not present in this checkout:
+
+- `arlm_generate.py`
+- `finetune_inbetween_on_arlm_samples.py`
+
+## Direct Script Usage
+
+For selector-only training, you can call the trainer directly:
 
 ```bash
-python pipeline.py visualize samples/sample_motion.npy
+python train_reconstruction.py
 ```
 
-## Config-Driven Settings
+Useful optional flags:
 
-Most behavior is configured in `config.py`, including:
+- `--force`
+- `--resume <checkpoint.pt>`
+- `--condmdi-ckpt <checkpoint.pt>`
+- `--device <device>`
 
-- optimizer and schedule
-- keyframe selector settings
-- selector mode and loss weights
-- diffusion architecture and loss weights
-- validation cadence and checkpoint behavior
+Checkpoint names are always derived from `selector_mode` in `ReconstructionTrainConfig`
+(for example `composite_selector_reconstruction_*`).
 
-Prefer changing defaults in `config.py` rather than adding CLI overrides.
+## Configuration
 
-## Recommended Workflow
+Core runtime defaults live in `config.py`:
 
-```bash
-# 1) Train baseline in-between model
-python pipeline.py train
+- `ReconstructionTrainConfig`: reconstruction selector training setup
+- `InbetweenTrainConfig`: legacy/full in-between training config block
+- `CompositeConfig`: inference/eval/default model settings
 
-# 2) (Optional) Generate ARLM conditioning set
-python pipeline.py arlm-generate --t2mgpt-root D:/Projects/T2M-GPT
-
-# 3) Continue training from the best checkpoint
-python pipeline.py train --inbetween-resume checkpoints/composite_inbetween_best.pt
-
-# 4) Evaluate all selector variants + T2M-GPT
-python pipeline.py evaluate --models all
-
-# 5) Generate qualitative sample
-python pipeline.py sample --prompt "a person spins and bows" --out-name qual_spin_bow
-```
+For this project state, prefer changing selector-related defaults in `ReconstructionTrainConfig`.
 
 ## Outputs
 
-### Checkpoints
+Typical artifacts produced by selector training:
 
-- `checkpoints/composite_inbetween_stepN.pt`
-- `checkpoints/composite_inbetween_best.pt`
-- selector-mode specific checkpoints (for example `composite_inbetween_information_gain_best.pt`) if trained with mode-specific prefixes
+- checkpoints under `checkpoints/` (for example `composite_selector_<mode>_best.pt`)
+- logs in `training_logs/` (CSV and convergence plot)
 
-### Training logs
-
-- `training_logs/inbetween_YYYYMMDD_HHMMSS.csv`
-- `training_logs/inbetween_YYYYMMDD_HHMMSS.png`
-
-### Sample outputs
-
-- `samples/<name>_ar_motion.npy`
-- `samples/<name>_ar_motion_native_norm.npy`
-- `samples/<name>_ar_motion_local_norm.npy`
-- `samples/<name>_motion.npy`
-- `samples/<name>_keyframes.npy`
-- `samples/<name>_keyframe_indices.npy`
-- `samples/<name>_meta.json`
-- `samples/<name>.gif` (or HTML fallback)
+Visualization outputs depend on CLI args and may include rendered files such as MP4.
 
 ## Main Files
 
 | File | Purpose |
 |---|---|
-| `pipeline.py` | Unified CLI entry point |
-| `config.py` | Config defaults for training/inference/eval |
-| `train.py` | In-between diffusion training loop |
-| `run_full_sample.py` | End-to-end sample generation |
-| `arlm_generate.py` | ARLM dataset generation |
-| `eval_ML3D.py` | HumanML3D evaluation |
-| `finetune_inbetween_on_arlm_samples.py` | Legacy conversion + resume helper |
-| `visualize.py` | Motion rendering utilities |
-| `models/diffusion.py` | Diffusion in-betweening + selector modules |
+| `pipeline.py` | Unified CLI and command dispatch |
+| `train_reconstruction.py` | Reconstruction selector training loop (external CondMDI-backed) |
+| `config.py` | Dataclass configs for training/eval/inference |
+| `run_full_sample.py` | Sample generation entry (currently depends on missing local `arlm_generate`) |
+| `eval_ML3D.py` | Evaluation entry (currently depends on missing local `arlm_generate`) |
+| `visualize.py` | Motion visualization utilities |
+| `condmdi_adapter.py` | Adapter for external CondMDI checkpoint usage |
+| `models/selector_modules/` | Selector implementations and factory (`build_keyframe_selector`) |
 
 ## Environment Notes
 

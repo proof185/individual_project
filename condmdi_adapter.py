@@ -122,11 +122,11 @@ class ExternalCondMDIDiffusionAdapter:
         abs_std: torch.Tensor,
         device: torch.device,
         max_frames: int,
-        oracle_model=None,
+        reconstruction_model=None,
     ):
         self.model = model
         self.diffusion = diffusion
-        self.oracle_model = oracle_model if oracle_model is not None else model
+        self.reconstruction_model = reconstruction_model if reconstruction_model is not None else model
         self.condmdi_root = condmdi_root
         self.local_mean = local_mean.to(device).view(1, -1, 1, 1)
         self.local_std = local_std.to(device).view(1, -1, 1, 1)
@@ -260,7 +260,7 @@ class ExternalCondMDIDiffusionAdapter:
                     'text': texts,
                 },
             }
-            x0_hat_abs = self.oracle_model(
+            x0_hat_abs = self.reconstruction_model(
                 padded_xt,
                 t_batch,
                 model_kwargs['y'],
@@ -439,23 +439,8 @@ def load_external_condmdi_runtime(
         abs_std=abs_std,
         device=target_device,
         max_frames=max_frames,
-        oracle_model=condmdi_model,
+        reconstruction_model=condmdi_model,
     )
     condmdi_model.keyframe_selector = None
     condmdi_model.is_external_condmdi = True
     return condmdi_model, adapter
-
-
-def load_external_condmdi_oracle(
-    checkpoint_path: str,
-    local_mean: torch.Tensor,
-    local_std: torch.Tensor,
-    device: str = 'cuda',
-):
-    model, adapter = load_external_condmdi_runtime(
-        checkpoint_path=checkpoint_path,
-        local_mean=local_mean,
-        local_std=local_std,
-        device=device,
-    )
-    return model, adapter
