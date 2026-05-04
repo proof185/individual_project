@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 import clip
 
+from condmdi_adapter import load_external_condmdi_runtime, looks_like_condmdi_checkpoint
+
 
 def encode_text_with_tokens(clip_model, texts: List[str], normalize: bool = True):
     """Encode text into pooled CLIP embeddings and per-token features."""
@@ -375,8 +377,7 @@ def load_inbetween_model(
     device: str = 'cuda',
     inbetween_ckpt_path: str | None = None,
 ):
-    """Load inbetween diffusion model and normalization stats from a checkpoint."""
-    from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+    """Load external CondMDI runtime and normalization stats from a checkpoint."""
     from models.selectors import build_keyframe_selector
 
     mean_path = os.path.join(cfg.root, 'Mean.npy')
@@ -388,9 +389,24 @@ def load_inbetween_model(
     if inbetween_ckpt_path is None:
         inbetween_ckpt_path = f'checkpoints/composite_inbetween_step{cfg.inbetween_steps}.pt'
 
+    if looks_like_condmdi_checkpoint(inbetween_ckpt_path):
+        inbetween_model, diff_inbetween = load_external_condmdi_runtime(
+            checkpoint_path=inbetween_ckpt_path,
+            local_mean=mean,
+            local_std=std,
+            device=device,
+        )
+        clip_model = setup_clip_model(device)
+        print(f'Loaded external CondMDI runtime from {inbetween_ckpt_path}')
+        return inbetween_model, diff_inbetween, clip_model, mean, std, Fdim
+
     ckpt = None
     if os.path.exists(inbetween_ckpt_path):
         ckpt = torch.load(inbetween_ckpt_path, map_location=device)
+
+    selector_state = ckpt.get('selector_ema', ckpt.get('selector')) if isinstance(ckpt, dict) else None
+    saved_cfg = ckpt.get('cfg') if isinstance(ckpt, dict) else None
+    external_inbetween_ckpt_path = saved_cfg.get('external_inbetween_ckpt_path') if isinstance(saved_cfg, dict) else None
 
     def _count_prefix_layers(state_dict: dict, prefix: str, index_pos: int) -> int:
         idx = set()
@@ -402,78 +418,62 @@ def load_inbetween_model(
                 idx.add(int(parts[index_pos]))
         return (max(idx) + 1) if idx else 0
 
-    inbetween_d_model = cfg.inbetween_d_model
-    inbetween_n_layers = cfg.inbetween_layers
-    inbetween_n_heads = cfg.inbetween_heads
+    def _attach_selector(runtime_model, selector_state_dict, saved_cfg_dict):
+        if not (cfg.use_learned_keyframe_selector and selector_state_dict is not None):
+            return runtime_model
 
-    if isinstance(ckpt, dict):
-        saved_cfg = ckpt.get('cfg')
-        if isinstance(saved_cfg, dict):
-            inbetween_d_model = int(saved_cfg.get('inbetween_d_model', saved_cfg.get('d_model', inbetween_d_model)))
-            inbetween_n_layers = int(saved_cfg.get('inbetween_layers', saved_cfg.get('n_layers', inbetween_n_layers)))
-            inbetween_n_heads = int(saved_cfg.get('inbetween_heads', saved_cfg.get('n_heads', inbetween_n_heads)))
-
-    inbetween_state = ckpt.get('inbetween') if isinstance(ckpt, dict) else None
-    if isinstance(inbetween_state, dict):
-        if 'frame_in.weight' in inbetween_state:
-            inbetween_d_model = int(inbetween_state['frame_in.weight'].shape[0])
-        counted = _count_prefix_layers(inbetween_state, 'encoder.layers.', 2)
-        if counted > 0:
-            inbetween_n_layers = counted
-
-    inbetween_model = InbetweenTransformer(
-        feature_dim=Fdim,
-        cond_dim=512,
-        d_model=inbetween_d_model,
-        n_layers=inbetween_n_layers,
-        n_heads=inbetween_n_heads,
-        dropout=cfg.dropout,
-        max_len=cfg.max_len + 10,
-    ).to(device)
-    diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
-
-    if ckpt is not None:
-        inbetween_state_for_infer = ckpt.get('inbetween_ema', ckpt['inbetween'])
-        inbetween_model.load_state_dict(inbetween_state_for_infer)
-
-        selector_state = ckpt.get('selector_ema', ckpt.get('selector'))
-        saved_cfg = ckpt.get('cfg') if isinstance(ckpt, dict) else None
         saved_selector_mode = cfg.selector_mode
         saved_selector_heads = cfg.selector_heads
         saved_selector_threshold = cfg.selector_threshold
         saved_selector_ratio = cfg.selector_target_ratio
-        if isinstance(saved_cfg, dict):
-            saved_selector_mode = str(saved_cfg.get('selector_mode', saved_selector_mode))
-            saved_selector_heads = int(saved_cfg.get('selector_heads', saved_selector_heads))
-            saved_selector_threshold = float(saved_cfg.get('selector_threshold', saved_selector_threshold))
-            saved_selector_ratio = float(saved_cfg.get('selector_target_ratio', saved_selector_ratio))
+        if isinstance(saved_cfg_dict, dict):
+            saved_selector_mode = str(saved_cfg_dict.get('selector_mode', saved_selector_mode))
+            saved_selector_heads = int(saved_cfg_dict.get('selector_heads', saved_selector_heads))
+            saved_selector_threshold = float(saved_cfg_dict.get('selector_threshold', saved_selector_threshold))
+            saved_selector_ratio = float(saved_cfg_dict.get('selector_target_ratio', saved_selector_ratio))
 
-        if cfg.use_learned_keyframe_selector and selector_state is not None:
-            selector_d_model = cfg.selector_d_model
-            if isinstance(selector_state, dict) and 'frame_in.weight' in selector_state:
-                selector_d_model = int(selector_state['frame_in.weight'].shape[0])
-            selector_layers = cfg.selector_layers
-            if isinstance(selector_state, dict):
-                selector_layers = _count_prefix_layers(selector_state, 'encoder.layers.', 2) or selector_layers
-            selector_model = build_keyframe_selector(
-                mode=saved_selector_mode,
-                feature_dim=Fdim,
-                cond_dim=512,
-                d_model=selector_d_model,
-                n_layers=selector_layers,
-                n_heads=saved_selector_heads,
-                dropout=cfg.selector_dropout,
-                max_len=cfg.max_len + 10,
-                threshold=saved_selector_threshold,
-                budget_ratio=saved_selector_ratio,
-            ).to(device)
-            if isinstance(selector_state, dict) and len(selector_state) > 0:
-                selector_model.load_state_dict(selector_state, strict=False)
-            selector_model.eval()
-            inbetween_model.keyframe_selector = selector_model
-            print(f'Loaded {saved_selector_mode} keyframe selector from checkpoint (EMA if available)')
-        print(f'Loaded inbetween model from {inbetween_ckpt_path} (EMA if available)')
+        selector_d_model = cfg.selector_d_model
+        if isinstance(selector_state_dict, dict) and 'frame_in.weight' in selector_state_dict:
+            selector_d_model = int(selector_state_dict['frame_in.weight'].shape[0])
+        selector_layers = cfg.selector_layers
+        if isinstance(selector_state_dict, dict):
+            selector_layers = _count_prefix_layers(selector_state_dict, 'encoder.layers.', 2) or selector_layers
 
-    inbetween_model.eval()
-    clip_model = setup_clip_model(device)
-    return inbetween_model, diff_inbetween, clip_model, mean, std, Fdim
+        selector_model = build_keyframe_selector(
+            mode=saved_selector_mode,
+            feature_dim=Fdim,
+            cond_dim=512,
+            d_model=selector_d_model,
+            n_layers=selector_layers,
+            n_heads=saved_selector_heads,
+            dropout=cfg.selector_dropout,
+            max_len=cfg.max_len + 10,
+            threshold=saved_selector_threshold,
+            budget_ratio=saved_selector_ratio,
+        ).to(device)
+        if isinstance(selector_state_dict, dict) and len(selector_state_dict) > 0:
+            selector_model.load_state_dict(selector_state_dict, strict=False)
+        selector_model.eval()
+        runtime_model.keyframe_selector = selector_model
+        print(f'Loaded {saved_selector_mode} keyframe selector from checkpoint (EMA if available)')
+        return runtime_model
+
+    if external_inbetween_ckpt_path:
+        resolved_external_path = os.path.abspath(os.path.join(os.path.dirname(inbetween_ckpt_path), external_inbetween_ckpt_path))
+        inbetween_model, diff_inbetween = load_external_condmdi_runtime(
+            checkpoint_path=resolved_external_path,
+            local_mean=mean,
+            local_std=std,
+            device=device,
+        )
+        inbetween_model = _attach_selector(inbetween_model, selector_state, saved_cfg)
+        inbetween_model.eval()
+        clip_model = setup_clip_model(device)
+        print(f'Loaded external CondMDI runtime from selector checkpoint {inbetween_ckpt_path}')
+        return inbetween_model, diff_inbetween, clip_model, mean, std, Fdim
+
+    raise ValueError(
+        'Local diffusion checkpoints are no longer supported. '
+        'Pass an external CondMDI checkpoint directly, or use a selector checkpoint '
+        'whose cfg.external_inbetween_ckpt_path points to a CondMDI checkpoint.'
+    )

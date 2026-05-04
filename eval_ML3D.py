@@ -688,6 +688,8 @@ class CompositeGenerator(BaseGenerator):
             keyframe_mask=keyframe_mask,
             guidance_scale=self.diff_guidance,
             cond_uncond=cond_uncond,
+            source_motion=ar_motion_norm.unsqueeze(0),
+            text_prompt=prompt,
         )[0]
         raw_motion = sampled_norm * (self.local_std + 1e-8) + self.local_mean
         return raw_motion.detach().cpu().numpy().astype(np.float32)

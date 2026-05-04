@@ -89,14 +89,20 @@ Runs sequential training for all supported selector variants by temporarily patc
 ```bash
 python pipeline.py train-selectors-all --force
 python pipeline.py train-selectors-all --only text_alignment,saliency
-python pipeline.py train-selectors-all --oracle-ckpt checkpoints/composite_inbetween_text_alignment_best.pt
 ```
+
+For `information_gain` and `retrieval_gain`, `train-selectors-all` now always points `selector_oracle_ckpt_path` at the sibling CondMDI checkpoint:
+
+```text
+../diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt
+```
+
+The shared diffusion base used for resumed selector training is still the local heuristic checkpoint.
 
 Useful flags:
 
 - `--force`
 - `--only`
-- `--oracle-ckpt`
 - `--keep-config`
 
 ### sample
@@ -105,6 +111,7 @@ Runs full sample generation via `run_full_sample.py`.
 
 ```bash
 python pipeline.py sample --prompt "a person walks forward"
+python pipeline.py sample --prompt "a person walks forward" --inbetween-ckpt ../diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt
 ```
 
 Useful flags:
@@ -114,6 +121,14 @@ Useful flags:
 - `--arlm-vq-ckpt`, `--arlm-gpt-ckpt`
 - `--out-dir`, `--out-name`
 - `--device`, `--stride`, `--interval-ms`
+
+If `--inbetween-ckpt` points to a real CondMDI checkpoint such as `diffusion-motion-inbetweening/save/condmdi_randomframes/model000750000.pt`, `individual_project` will now route in-between sampling through the external CondMDI repo instead of the local reimplementation.
+
+Current scope:
+
+- external CondMDI is wired for inference-time sampling and evaluation paths
+- local selector training remains unchanged
+- when using an external CondMDI checkpoint, no learned selector is loaded from that checkpoint, so keyframe selection falls back to the heuristic path unless you add a selector separately
 
 ### arlm-generate
 

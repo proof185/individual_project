@@ -16,9 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from config import InbetweenTrainConfig
 from dataset import HUMANML3DCompositeDataset, collate_composite
-from models.diffusion import InbetweenDiffusion, InbetweenTransformer
+from condmdi_adapter import load_external_condmdi_oracle, looks_like_condmdi_checkpoint
 from models.selectors import SELECTOR_MODE_CHOICES, build_keyframe_selector
 from utils import (
     boundary_jerk_loss,
@@ -217,27 +216,22 @@ def _load_oracle_inbetween_model(
     oracle_ckpt_path: str,
     feature_dim: int,
     device: torch.device,
+    local_mean: torch.Tensor | None = None,
+    local_std: torch.Tensor | None = None,
 ):
-    oracle_cfg = InbetweenTrainConfig()
-    _apply_inbetween_arch_from_checkpoint(oracle_cfg, oracle_ckpt_path, device)
-    oracle_model = InbetweenTransformer(
-        feature_dim=feature_dim,
-        cond_dim=512,
-        d_model=oracle_cfg.inbetween_d_model,
-        n_layers=oracle_cfg.inbetween_layers,
-        n_heads=oracle_cfg.inbetween_heads,
-        dropout=oracle_cfg.dropout,
-        max_len=oracle_cfg.max_len + 10,
-    ).to(device)
-    oracle_diff = InbetweenDiffusion(oracle_cfg.T_diffusion, device=device)
-
-    checkpoint = torch.load(oracle_ckpt_path, map_location=device)
-    state = checkpoint.get('inbetween_ema', checkpoint.get('inbetween'))
-    if state is None:
-        raise ValueError(f'Missing inbetween weights in oracle checkpoint: {oracle_ckpt_path}')
-    oracle_model.load_state_dict(state)
-    oracle_model.eval()
-    return oracle_model, oracle_diff
+    if looks_like_condmdi_checkpoint(oracle_ckpt_path):
+        if local_mean is None or local_std is None:
+            raise ValueError('External CondMDI oracle loading requires local_mean and local_std.')
+        return load_external_condmdi_oracle(
+            checkpoint_path=oracle_ckpt_path,
+            local_mean=local_mean.detach().cpu(),
+            local_std=local_std.detach().cpu(),
+            device=str(device),
+        )
+    raise ValueError(
+        'Local diffusion oracle checkpoints are no longer supported. '
+        'Selector oracle generation must use an external CondMDI checkpoint.'
+    )
 
 
 def _parse_selector_text_entry(text_entry: str) -> tuple[str, list[str]]:
@@ -379,6 +373,7 @@ def _oracle_loss_for_observed_indices(
     observed_indices: list[int],
     frame_weights: torch.Tensor,
     oracle_timesteps: list[int],
+    text_prompt: str | None = None,
 ) -> float:
     x0_batch = x0.unsqueeze(0)
     mask_batch = valid_mask.unsqueeze(0)
@@ -387,10 +382,23 @@ def _oracle_loss_for_observed_indices(
     losses = []
     for t in oracle_timesteps:
         t_batch = torch.full((1,), int(t), device=x0.device, dtype=torch.long)
-        noise = torch.randn_like(x0_batch)
-        xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
-        xt = oracle_diff._replace_keyframes(xt, keyframes, keyframe_indices, keyframe_mask)
-        x0_hat = oracle_model(xt, t_batch, cond, mask_batch, keyframes, keyframe_indices, keyframe_mask)
+        if hasattr(oracle_diff, 'predict_x0_local'):
+            if not text_prompt:
+                raise ValueError('External CondMDI oracle path requires text_prompt.')
+            obs_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+            obs_mask[keyframe_indices[0][keyframe_mask[0]]] = True
+            x0_hat = oracle_diff.predict_x0_local(
+                x0_batch,
+                mask_batch,
+                t_batch,
+                obs_mask.unsqueeze(0),
+                [text_prompt],
+            )
+        else:
+            noise = torch.randn_like(x0_batch)
+            xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+            xt = oracle_diff._replace_keyframes(xt, keyframes, keyframe_indices, keyframe_mask)
+            x0_hat = oracle_model(xt, t_batch, cond, mask_batch, keyframes, keyframe_indices, keyframe_mask)
 
         obs_mask = torch.zeros_like(valid_mask, dtype=torch.float32)
         obs_mask[keyframe_indices[0][keyframe_mask[0]]] = 1.0
@@ -411,6 +419,7 @@ def _oracle_candidate_losses(
     frame_weights: torch.Tensor,
     oracle_timesteps: list[int],
     chunk_size: int = 64,
+    text_prompt: str | None = None,
 ) -> torch.Tensor:
     if not candidate_indices:
         return torch.empty(0, device=x0.device)
@@ -436,21 +445,32 @@ def _oracle_candidate_losses(
 
         for t in oracle_timesteps:
             t_batch = torch.full((C,), int(t), device=x0.device, dtype=torch.long)
-            noise = torch.randn_like(x0_batch)
-            xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
-            xt = oracle_diff._replace_keyframes(
-                xt,
-                observation_mask=obs_mask,
-                keyframe_canvas=keyframe_canvas,
-            )
-            x0_hat = oracle_model(
-                xt,
-                t_batch,
-                cond.expand(C, -1),
-                mask_batch,
-                observation_mask=obs_mask,
-                keyframe_canvas=keyframe_canvas,
-            )
+            if hasattr(oracle_diff, 'predict_x0_local'):
+                if not text_prompt:
+                    raise ValueError('External CondMDI oracle path requires text_prompt.')
+                x0_hat = oracle_diff.predict_x0_local(
+                    x0_batch,
+                    mask_batch,
+                    t_batch,
+                    obs_mask.bool(),
+                    [text_prompt] * C,
+                )
+            else:
+                noise = torch.randn_like(x0_batch)
+                xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+                xt = oracle_diff._replace_keyframes(
+                    xt,
+                    observation_mask=obs_mask,
+                    keyframe_canvas=keyframe_canvas,
+                )
+                x0_hat = oracle_model(
+                    xt,
+                    t_batch,
+                    cond.expand(C, -1),
+                    mask_batch,
+                    observation_mask=obs_mask,
+                    keyframe_canvas=keyframe_canvas,
+                )
             loss_accum = loss_accum + ((x0_batch - x0_hat) ** 2 * weights.unsqueeze(-1)).sum(dim=(1, 2)) / (
                 weights.sum(dim=1).clamp(min=1e-8) * x0.shape[-1]
             )
@@ -471,6 +491,7 @@ def _oracle_retrieval_margin_for_observed_indices(
     positive_text_embedding: torch.Tensor,
     negative_text_embeddings: torch.Tensor,
     oracle_timesteps: list[int],
+    text_prompt: str | None = None,
 ) -> float:
     x0_batch = x0.unsqueeze(0)
     mask_batch = valid_mask.unsqueeze(0)
@@ -483,21 +504,32 @@ def _oracle_retrieval_margin_for_observed_indices(
     margins = []
     for t in oracle_timesteps:
         t_batch = torch.full((1,), int(t), device=x0.device, dtype=torch.long)
-        noise = torch.randn_like(x0_batch)
-        xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
-        xt = oracle_diff._replace_keyframes(
-            xt,
-            observation_mask=obs_mask_batch,
-            keyframe_canvas=keyframe_canvas,
-        )
-        x0_hat = oracle_model(
-            xt,
-            t_batch,
-            cond,
-            mask_batch,
-            observation_mask=obs_mask_batch,
-            keyframe_canvas=keyframe_canvas,
-        )
+        if hasattr(oracle_diff, 'predict_x0_local'):
+            if not text_prompt:
+                raise ValueError('External CondMDI oracle path requires text_prompt.')
+            x0_hat = oracle_diff.predict_x0_local(
+                x0_batch,
+                mask_batch,
+                t_batch,
+                obs_mask_batch.bool(),
+                [text_prompt],
+            )
+        else:
+            noise = torch.randn_like(x0_batch)
+            xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+            xt = oracle_diff._replace_keyframes(
+                xt,
+                observation_mask=obs_mask_batch,
+                keyframe_canvas=keyframe_canvas,
+            )
+            x0_hat = oracle_model(
+                xt,
+                t_batch,
+                cond,
+                mask_batch,
+                observation_mask=obs_mask_batch,
+                keyframe_canvas=keyframe_canvas,
+            )
         motion_embeddings = _evaluator_motion_embeddings(eval_wrapper, x0_hat, motion_lengths)
         margin = _retrieval_margin_from_motion_embeddings(
             positive_text_embedding,
@@ -521,6 +553,7 @@ def _oracle_candidate_retrieval_margins(
     negative_text_embeddings: torch.Tensor,
     oracle_timesteps: list[int],
     chunk_size: int = 64,
+    text_prompt: str | None = None,
 ) -> torch.Tensor:
     if not candidate_indices:
         return torch.empty(0, device=x0.device)
@@ -546,21 +579,32 @@ def _oracle_candidate_retrieval_margins(
 
         for t in oracle_timesteps:
             t_batch = torch.full((C,), int(t), device=x0.device, dtype=torch.long)
-            noise = torch.randn_like(x0_batch)
-            xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
-            xt = oracle_diff._replace_keyframes(
-                xt,
-                observation_mask=obs_mask,
-                keyframe_canvas=keyframe_canvas,
-            )
-            x0_hat = oracle_model(
-                xt,
-                t_batch,
-                cond.expand(C, -1),
-                mask_batch,
-                observation_mask=obs_mask,
-                keyframe_canvas=keyframe_canvas,
-            )
+            if hasattr(oracle_diff, 'predict_x0_local'):
+                if not text_prompt:
+                    raise ValueError('External CondMDI oracle path requires text_prompt.')
+                x0_hat = oracle_diff.predict_x0_local(
+                    x0_batch,
+                    mask_batch,
+                    t_batch,
+                    obs_mask.bool(),
+                    [text_prompt] * C,
+                )
+            else:
+                noise = torch.randn_like(x0_batch)
+                xt = oracle_diff.q_sample(x0_batch, t_batch, noise)
+                xt = oracle_diff._replace_keyframes(
+                    xt,
+                    observation_mask=obs_mask,
+                    keyframe_canvas=keyframe_canvas,
+                )
+                x0_hat = oracle_model(
+                    xt,
+                    t_batch,
+                    cond.expand(C, -1),
+                    mask_batch,
+                    observation_mask=obs_mask,
+                    keyframe_canvas=keyframe_canvas,
+                )
             motion_embeddings = _evaluator_motion_embeddings(eval_wrapper, x0_hat, motion_lengths)
             margin_accum = margin_accum + _retrieval_margin_from_motion_embeddings(
                 positive_text_embedding,
@@ -580,6 +624,7 @@ def _build_information_gain_target_for_item(
     cond: torch.Tensor,
     selector_target_ratio: float,
     oracle_timesteps: list[int],
+    text_prompt: str | None = None,
 ) -> torch.Tensor:
     x0 = motion.float()
     valid_mask = torch.ones(x0.shape[0], dtype=torch.bool, device=x0.device)
@@ -598,6 +643,7 @@ def _build_information_gain_target_for_item(
         observed,
         frame_weights,
         oracle_timesteps,
+        text_prompt=text_prompt,
     )
 
     while len(observed) < budget:
@@ -614,6 +660,7 @@ def _build_information_gain_target_for_item(
             candidates,
             frame_weights,
             oracle_timesteps,
+            text_prompt=text_prompt,
         )
         gains = baseline_loss - candidate_losses
         best_pos = int(torch.argmax(gains).item())
@@ -641,6 +688,7 @@ def _build_retrieval_gain_target_for_item(
     negative_text_embeddings: torch.Tensor,
     selector_target_ratio: float,
     oracle_timesteps: list[int],
+    text_prompt: str | None = None,
 ) -> torch.Tensor:
     x0 = motion.float()
     valid_mask = torch.ones(x0.shape[0], dtype=torch.bool, device=x0.device)
@@ -660,6 +708,7 @@ def _build_retrieval_gain_target_for_item(
         positive_text_embedding,
         negative_text_embeddings,
         oracle_timesteps,
+        text_prompt=text_prompt,
     )
 
     while len(observed) < budget:
@@ -678,6 +727,7 @@ def _build_retrieval_gain_target_for_item(
             positive_text_embedding,
             negative_text_embeddings,
             oracle_timesteps,
+            text_prompt=text_prompt,
         )
         gains = candidate_margins - baseline_margin
         best_pos = int(torch.argmax(gains).item())
@@ -701,7 +751,13 @@ def _prepare_information_gain_oracle_targets(dataset, cfg, device: torch.device,
         print(f'Loading information-gain oracle cache: {cache_path}')
         return torch.load(cache_path)
 
-    oracle_model, oracle_diff = _load_oracle_inbetween_model(oracle_ckpt_path, dataset.feature_dim, device)
+    oracle_model, oracle_diff = _load_oracle_inbetween_model(
+        oracle_ckpt_path,
+        dataset.feature_dim,
+        device,
+        local_mean=dataset.mean,
+        local_std=dataset.std,
+    )
     oracle_timesteps_count = max(1, int(getattr(cfg, 'selector_oracle_timesteps', 3)))
     oracle_timesteps = torch.linspace(1, cfg.T_diffusion - 1, steps=oracle_timesteps_count).round().long().tolist()
 
@@ -712,6 +768,7 @@ def _prepare_information_gain_oracle_targets(dataset, cfg, device: torch.device,
         if dataset.normalize:
             motion = (motion - dataset.mean.to(device)) / (dataset.std.to(device) + 1e-8)
         cond = dataset.embeddings[item['id']].mean(dim=0, keepdim=True).to(device)
+        text_prompt = _parse_selector_text_entry(item['texts'][0])[0] if item.get('texts') else ''
         oracle_targets[item['id']] = _build_information_gain_target_for_item(
             oracle_model,
             oracle_diff,
@@ -719,6 +776,7 @@ def _prepare_information_gain_oracle_targets(dataset, cfg, device: torch.device,
             cond,
             cfg.selector_target_ratio,
             oracle_timesteps,
+            text_prompt=text_prompt,
         )
         if idx % 100 == 0:
             print(f'  oracle labels: {idx}/{len(dataset.data)}')
@@ -743,7 +801,13 @@ def _prepare_retrieval_gain_oracle_targets(dataset, cfg, device: torch.device, o
     eval_root = os.path.abspath(eval_root)
     eval_wrapper, word_vectorizer = _load_retrieval_eval_components(eval_root, device)
     text_embedding_cache = _build_retrieval_text_embedding_cache(dataset, eval_wrapper, word_vectorizer)
-    oracle_model, oracle_diff = _load_oracle_inbetween_model(oracle_ckpt_path, dataset.feature_dim, device)
+    oracle_model, oracle_diff = _load_oracle_inbetween_model(
+        oracle_ckpt_path,
+        dataset.feature_dim,
+        device,
+        local_mean=dataset.mean,
+        local_std=dataset.std,
+    )
     oracle_timesteps_count = max(1, int(getattr(cfg, 'selector_oracle_timesteps', 3)))
     oracle_timesteps = torch.linspace(1, cfg.T_diffusion - 1, steps=oracle_timesteps_count).round().long().tolist()
     negative_count = max(1, int(getattr(cfg, 'selector_retrieval_negatives', 31)))
@@ -755,6 +819,7 @@ def _prepare_retrieval_gain_oracle_targets(dataset, cfg, device: torch.device, o
         if dataset.normalize:
             motion = (motion - dataset.mean.to(device)) / (dataset.std.to(device) + 1e-8)
         cond = dataset.embeddings[item['id']].mean(dim=0, keepdim=True).to(device)
+        text_prompt = _parse_selector_text_entry(item['texts'][0])[0] if item.get('texts') else ''
         positive_text_embedding = text_embedding_cache[item['id']].mean(dim=0).to(device)
         negative_text_embeddings = _sample_retrieval_negative_embeddings(
             item['id'],
@@ -771,6 +836,7 @@ def _prepare_retrieval_gain_oracle_targets(dataset, cfg, device: torch.device, o
             negative_text_embeddings,
             cfg.selector_target_ratio,
             oracle_timesteps,
+            text_prompt=text_prompt,
         )
         if idx % 100 == 0:
             print(f'  oracle labels: {idx}/{len(dataset.data)}')
@@ -782,6 +848,25 @@ def _prepare_retrieval_gain_oracle_targets(dataset, cfg, device: torch.device, o
 
 def _selector_mode_uses_oracle_targets(selector_mode: str) -> bool:
     return str(selector_mode).strip().lower() in {'information_gain', 'retrieval_gain'}
+
+
+def _selector_mode_uses_external_condmdi(selector_mode: str) -> bool:
+    return str(selector_mode).strip().lower() in {'text_alignment', 'information_gain', 'retrieval_gain'}
+
+
+def _selector_uses_external_condmdi_runtime(cfg) -> bool:
+    dedicated_selector_cfg = hasattr(cfg, 'selector_steps')
+    return bool(
+        (
+            dedicated_selector_cfg
+            or (
+                getattr(cfg, 'use_learned_keyframe_selector', False)
+                and getattr(cfg, 'freeze_inbetween_for_selector', False)
+            )
+        )
+        and getattr(cfg, 'external_inbetween_ckpt_path', None)
+        and _selector_mode_uses_external_condmdi(cfg.selector_mode)
+    )
 
 
 def _prepare_selector_oracle_targets(dataset, cfg, device: torch.device, oracle_ckpt_path: str):
@@ -965,12 +1050,16 @@ def _compute_inbetween_loss(
     selector_budget_weight: float,
     selector_entropy_weight: float,
     selector_oracle_target: torch.Tensor | None = None,
+    selector_train_without_diffusion: bool = False,
 ):
     B = x0.shape[0]
-    t = torch.randint(0, cfg.T_diffusion, (B,), device=x0.device)
-    noise = torch.randn_like(x0)
-    xt = diff_inbetween.q_sample(x0, t, noise)
-    xt = xt * mask.float().unsqueeze(-1)
+    t = None
+    xt = None
+    if not selector_train_without_diffusion:
+        t = torch.randint(0, cfg.T_diffusion, (B,), device=x0.device)
+        noise = torch.randn_like(x0)
+        xt = diff_inbetween.q_sample(x0, t, noise)
+        xt = xt * mask.float().unsqueeze(-1)
 
     selector_ratio = None
     selector_budget_loss = x0.new_tensor(0.0)
@@ -980,25 +1069,6 @@ def _compute_inbetween_loss(
     if keyframe_selector is not None:
         selector_is_trainable = getattr(keyframe_selector, 'is_trainable', True)
         selector_probs, selector_mask_st = keyframe_selector(x0, mask, cond=cond)
-        keyframe_canvas = selector_mask_st.unsqueeze(-1) * x0
-
-        xt = diff_inbetween._replace_keyframes(
-            xt,
-            observation_mask=selector_mask_st,
-            keyframe_canvas=keyframe_canvas,
-        )
-        x0_hat = inbetween_model(
-            xt,
-            t,
-            cond,
-            mask,
-            observation_mask=selector_mask_st,
-            keyframe_canvas=keyframe_canvas,
-        )
-
-        non_keyframe_weights = (1.0 - selector_mask_st) * mask.float()
-        loss = weighted_masked_mse(x0, x0_hat, non_keyframe_weights, mask)
-
         selector_ratio = (selector_probs * mask.float()).sum() / (mask.float().sum() + 1e-8)
         if selector_is_trainable:
             selector_budget_loss = (selector_ratio - cfg.selector_target_ratio) ** 2
@@ -1013,18 +1083,43 @@ def _compute_inbetween_loss(
                 selector_mask_st,
                 oracle_target=selector_oracle_target,
             )
-        loss = (
-            loss
-            + selector_budget_weight * selector_budget_loss
-            + selector_entropy_weight * selector_entropy_loss
-            + float(cfg.selector_aux_weight) * selector_aux_loss
-        )
+        if selector_train_without_diffusion:
+            loss = (
+                selector_budget_weight * selector_budget_loss
+                + selector_entropy_weight * selector_entropy_loss
+                + float(cfg.selector_aux_weight) * selector_aux_loss
+            )
+        else:
+            keyframe_canvas = selector_mask_st.unsqueeze(-1) * x0
 
-        keyframes, keyframe_indices, keyframe_mask = _frame_mask_to_sparse_keyframes(
-            x0,
-            selector_mask_st.detach(),
-            mask,
-        )
+            xt = diff_inbetween._replace_keyframes(
+                xt,
+                observation_mask=selector_mask_st,
+                keyframe_canvas=keyframe_canvas,
+            )
+            x0_hat = inbetween_model(
+                xt,
+                t,
+                cond,
+                mask,
+                observation_mask=selector_mask_st,
+                keyframe_canvas=keyframe_canvas,
+            )
+
+            non_keyframe_weights = (1.0 - selector_mask_st) * mask.float()
+            loss = weighted_masked_mse(x0, x0_hat, non_keyframe_weights, mask)
+            loss = (
+                loss
+                + selector_budget_weight * selector_budget_loss
+                + selector_entropy_weight * selector_entropy_loss
+                + float(cfg.selector_aux_weight) * selector_aux_loss
+            )
+
+            keyframes, keyframe_indices, keyframe_mask = _frame_mask_to_sparse_keyframes(
+                x0,
+                selector_mask_st.detach(),
+                mask,
+            )
     else:
         xt = diff_inbetween._replace_keyframes(xt, keyframes, keyframe_indices, keyframe_mask)
         x0_hat = inbetween_model(xt, t, cond, mask, keyframes, keyframe_indices, keyframe_mask)
@@ -1036,7 +1131,7 @@ def _compute_inbetween_loss(
         loss = masked_mse(x0, x0_hat, non_keyframe_mask)
 
     boundary_jerk_weight = float(getattr(cfg, 'boundary_jerk_weight', 0.0))
-    if boundary_jerk_weight > 0.0:
+    if boundary_jerk_weight > 0.0 and not selector_train_without_diffusion:
         loss = loss + boundary_jerk_weight * boundary_jerk_loss(
             x0,
             x0_hat,
@@ -1066,7 +1161,9 @@ def _evaluate_inbetween(
     device,
     selector_oracle_targets: dict | None = None,
 ):
-    inbetween_model.eval()
+    if inbetween_model is not None:
+        inbetween_model.eval()
+    selector_train_without_diffusion = _selector_uses_external_condmdi_runtime(cfg)
     if keyframe_selector is not None:
         keyframe_selector.eval()
 
@@ -1097,10 +1194,12 @@ def _evaluate_inbetween(
             selector_budget_weight=cfg.selector_budget_weight,
             selector_entropy_weight=cfg.selector_entropy_weight,
             selector_oracle_target=selector_oracle_target,
+            selector_train_without_diffusion=selector_train_without_diffusion,
         )
         loss_values.append(out['loss'].item())
 
-    inbetween_model.train()
+    if inbetween_model is not None:
+        inbetween_model.train()
     if keyframe_selector is not None:
         keyframe_selector.train()
 
@@ -1114,225 +1213,11 @@ def main(
     inbetween_resume: str | None = None,
     inbetween_ckpt_prefix: str | None = None,
 ):
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print('device:', device)
-    
-    cfg = InbetweenTrainConfig()
-    
-    if inbetween_resume is not None:
-        inbetween_resume = inbetween_resume.strip()
-    
-    cfg.selector_mode = str(cfg.selector_mode).strip().lower()
-    
-    if cfg.selector_mode not in SELECTOR_MODE_CHOICES:
-        raise ValueError(f"Unknown selector mode {cfg.selector_mode!r}. Expected one of {SELECTOR_MODE_CHOICES}.")
-    
-    if inbetween_ckpt_prefix is None or not inbetween_ckpt_prefix.strip():
-        inbetween_ckpt_prefix = _default_inbetween_ckpt_prefix(cfg)
-    
-    inbetween_ckpt_prefix = inbetween_ckpt_prefix.strip()
-    
-    selector_state = 'enabled' if cfg.use_learned_keyframe_selector else 'disabled'
-    print(
-        f"Keyframe strategy (dataset fallback): {cfg.keyframe_strategy} | "
-        f"selector: {selector_state} ({cfg.selector_mode})"
+    del force_retrain, inbetween_resume, inbetween_ckpt_prefix
+    raise RuntimeError(
+        'Legacy local diffusion training has been removed. '
+        'Use selector_train.py or `pipeline.py train-selectors-all` with external CondMDI instead.'
     )
-
-    inbetween_final_ckpt_path = f'checkpoints/{inbetween_ckpt_prefix}_step{cfg.inbetween_steps}.pt'
-    
-    # Load in-between architecture from checkpoint if available
-    if not force_retrain:
-        arch_ckpt_path = None
-        if inbetween_resume is not None and os.path.exists(inbetween_resume):
-            arch_ckpt_path = inbetween_resume
-        elif os.path.exists(inbetween_final_ckpt_path):
-            arch_ckpt_path = inbetween_final_ckpt_path
-        if arch_ckpt_path is not None:
-            _apply_inbetween_arch_from_checkpoint(cfg, arch_ckpt_path, device)
-            print(
-                'In-between architecture from checkpoint:',
-                arch_ckpt_path,
-                f"d_model={cfg.inbetween_d_model}",
-                f"layers={cfg.inbetween_layers}",
-                f"selector_d_model={cfg.selector_d_model}",
-                f"selector_layers={cfg.selector_layers}",
-                f"selector_mode={cfg.selector_mode}",
-            )
-    
-    # Load normalization statistics
-    mean_path = os.path.join(cfg.root, 'Mean.npy')
-    std_path = os.path.join(cfg.root, 'Std.npy')
-    
-    mean = torch.from_numpy(np.load(mean_path)).float().view(-1)
-    std = torch.from_numpy(np.load(std_path)).float().view(-1)
-    
-    Fdim = mean.shape[0]
-    
-    print('Feature dim:', Fdim)
-    
-    # Setup CLIP
-    clip_model = setup_clip_model(device)
-    
-    text_encoder = TextEncoderWrapper(clip_model)
-    
-    empty_emb, _, _ = text_encoder.encode_with_tokens([''])
-    empty_emb = empty_emb.squeeze(0)
-    
-    print('Empty embedding norm:', empty_emb.norm().item())
-    
-    # Create dataset
-    dataset = HUMANML3DCompositeDataset(
-        cfg.root,
-        split='train',
-        max_len=cfg.max_len,
-        normalize=True,
-        use_cache=True,
-        text_encoder=text_encoder,
-        keyframe_interval=cfg.keyframe_interval,
-        keyframe_strategy=cfg.keyframe_strategy,
-        keyframe_count=cfg.keyframe_count,
-        keyframe_min=cfg.keyframe_min,
-        keyframe_max=cfg.keyframe_max,
-        keyframe_include_ends=cfg.keyframe_include_ends,
-        include_keyframes=True,
-        conditioning_motion_dir=cfg.keyframe_source_dir,
-        mean=mean,
-        std=std,
-        device=device,
-        load_token_embeddings=False,
-    )
-    
-    print('Dataset size:', len(dataset))
-
-    val_dataset = None
-    val_loader = None
-    val_split_file = os.path.join(cfg.root, f'{cfg.val_split}.txt')
-    if os.path.exists(val_split_file):
-        val_dataset = HUMANML3DCompositeDataset(
-            cfg.root,
-            split=cfg.val_split,
-            max_len=cfg.max_len,
-            normalize=True,
-            use_cache=True,
-            text_encoder=text_encoder,
-            keyframe_interval=cfg.keyframe_interval,
-            keyframe_strategy=cfg.keyframe_strategy,
-            keyframe_count=cfg.keyframe_count,
-            keyframe_min=cfg.keyframe_min,
-            keyframe_max=cfg.keyframe_max,
-            keyframe_include_ends=cfg.keyframe_include_ends,
-            conditioning_motion_dir=cfg.keyframe_source_dir,
-            mean=mean,
-            std=std,
-            device=device,
-            load_token_embeddings=False,
-        )
-        val_loader_kwargs = {
-            'batch_size': min(cfg.val_batch_size, cfg.batch_size),
-            'shuffle': False,
-            'num_workers': cfg.num_workers,
-            'collate_fn': collate_composite,
-            'drop_last': False,
-            'pin_memory': bool(cfg.pin_memory and device.type == 'cuda'),
-        }
-        if cfg.num_workers > 0:
-            val_loader_kwargs['persistent_workers'] = cfg.persistent_workers
-            val_loader_kwargs['prefetch_factor'] = cfg.prefetch_factor
-        val_loader = DataLoader(val_dataset, **val_loader_kwargs)
-        print(f"Validation dataset size: {len(val_dataset)} ({cfg.val_split})")
-    else:
-        print(f"Validation split file not found: {val_split_file}; best-checkpoint selection disabled.")
-
-    selector_oracle_targets = None
-    val_selector_oracle_targets = None
-    if cfg.use_learned_keyframe_selector and _selector_mode_uses_oracle_targets(cfg.selector_mode):
-        oracle_ckpt_path = cfg.selector_oracle_ckpt_path or _default_selector_oracle_ckpt_path()
-        if not oracle_ckpt_path:
-            raise FileNotFoundError(
-                f'{cfg.selector_mode} selector requires an oracle diffusion checkpoint. '
-                'Pass --selector-oracle-ckpt or train a transformer in-between checkpoint first.'
-            )
-        oracle_ckpt_path = os.path.abspath(oracle_ckpt_path)
-        selector_oracle_targets = _prepare_selector_oracle_targets(dataset, cfg, device, oracle_ckpt_path)
-        if val_dataset is not None:
-            val_selector_oracle_targets = _prepare_selector_oracle_targets(val_dataset, cfg, device, oracle_ckpt_path)
-    
-    loader_kwargs = {
-        'batch_size': cfg.batch_size,
-        'shuffle': True,
-        'num_workers': cfg.num_workers,
-        'collate_fn': collate_composite,
-        'drop_last': True,
-        'pin_memory': bool(cfg.pin_memory and device.type == 'cuda'),
-    }
-    if cfg.num_workers > 0:
-        loader_kwargs['persistent_workers'] = cfg.persistent_workers
-        loader_kwargs['prefetch_factor'] = cfg.prefetch_factor
-    loader = DataLoader(dataset, **loader_kwargs)
-    print(
-        'DataLoader:',
-        f"workers={cfg.num_workers}",
-        f"batch_size={cfg.batch_size}",
-        f"grad_accum={cfg.grad_accum_steps}",
-        f"effective_batch={cfg.batch_size * cfg.grad_accum_steps}",
-        f"pin_memory={loader_kwargs['pin_memory']}",
-        f"persistent_workers={loader_kwargs.get('persistent_workers', False)}",
-        f"prefetch_factor={loader_kwargs.get('prefetch_factor', 'n/a')}"
-    )
-
-    inbetween_model = InbetweenTransformer(
-        feature_dim=Fdim,
-        cond_dim=512,
-        d_model=cfg.inbetween_d_model,
-        n_layers=cfg.inbetween_layers,
-        n_heads=cfg.inbetween_heads,
-        dropout=cfg.dropout,
-        max_len=cfg.max_len + 10,
-    ).to(device)
-    print(f'In-betweening model params: {sum(p.numel() for p in inbetween_model.parameters())/1e6:.2f}M')
-
-    keyframe_selector = None
-    if cfg.use_learned_keyframe_selector:
-        keyframe_selector = build_keyframe_selector(
-            mode=cfg.selector_mode,
-            feature_dim=Fdim,
-            cond_dim=512,
-            d_model=cfg.selector_d_model,
-            n_layers=cfg.selector_layers,
-            n_heads=cfg.selector_heads,
-            dropout=cfg.selector_dropout,
-            max_len=cfg.max_len + 10,
-            threshold=cfg.selector_threshold,
-            budget_ratio=cfg.selector_target_ratio,
-        ).to(device)
-        print(
-            f"Keyframe selector [{cfg.selector_mode}] params: "
-            f"{sum(p.numel() for p in keyframe_selector.parameters())/1e6:.2f}M"
-        )
-    
-    diff_inbetween = InbetweenDiffusion(cfg.T_diffusion, device=device)
-
-    train_inbetween(
-        inbetween_model,
-        diff_inbetween,
-        loader,
-        val_loader,
-        dataset,
-        empty_emb,
-        cfg,
-        device,
-        mean,
-        std,
-        force_retrain,
-        keyframe_selector=keyframe_selector,
-        resume_ckpt_path=inbetween_resume,
-        ckpt_prefix=inbetween_ckpt_prefix,
-        selector_oracle_targets=selector_oracle_targets,
-        val_selector_oracle_targets=val_selector_oracle_targets,
-    )
-    
-    print("Training complete!")
 
 
 def _frame_mask_to_sparse_keyframes(
@@ -1393,10 +1278,11 @@ def train_inbetween(
     if os.path.exists(inbetween_final_ckpt_path) and not force_retrain and not resume_ckpt_path:
         print(f"Loading In-Betweening model from final checkpoint: {inbetween_final_ckpt_path}")
         inbetween_ckpt = torch.load(inbetween_final_ckpt_path, map_location=device)
-        if cfg.use_ema_for_sampling and inbetween_ckpt.get('inbetween_ema') is not None:
-            inbetween_model.load_state_dict(inbetween_ckpt['inbetween_ema'])
-        else:
-            inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
+        if inbetween_model is not None:
+            if cfg.use_ema_for_sampling and inbetween_ckpt.get('inbetween_ema') is not None:
+                inbetween_model.load_state_dict(inbetween_ckpt['inbetween_ema'])
+            elif inbetween_ckpt.get('inbetween') is not None:
+                inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
         if keyframe_selector is not None:
             selector_key = 'selector_ema' if cfg.use_ema_for_sampling and inbetween_ckpt.get('selector_ema') is not None else 'selector'
             if inbetween_ckpt.get(selector_key) is not None:
@@ -1414,9 +1300,12 @@ def train_inbetween(
         getattr(cfg, 'freeze_inbetween_for_selector', False)
         and keyframe_selector is not None
     )
-    if selector_only_training:
+    selector_train_without_diffusion = _selector_uses_external_condmdi_runtime(cfg) and selector_only_training
+    if selector_only_training and inbetween_model is not None:
         for param in inbetween_model.parameters():
             param.requires_grad = False
+    if selector_train_without_diffusion:
+        print('Optimizer setup: selector-only. No in-between optimizer group will be created.')
 
     inbetween_lr = float(cfg.inbetween_lr if cfg.inbetween_lr is not None else cfg.lr)
     selector_has_trainable_params = False
@@ -1431,7 +1320,7 @@ def train_inbetween(
             {'params': selector_params, 'lr': selector_lr, 'name': 'selector'},
         ]
         base_lrs = [selector_lr]
-    elif selector_has_trainable_params:
+    elif selector_has_trainable_params and inbetween_model is not None:
         selector_lr = float(cfg.selector_lr if cfg.selector_lr is not None else (inbetween_lr * cfg.selector_lr_scale))
         param_groups = [
             {'params': list(inbetween_model.parameters()), 'lr': inbetween_lr, 'name': 'inbetween'},
@@ -1450,11 +1339,11 @@ def train_inbetween(
     for group in param_groups:
         all_params.extend(group['params'])
 
-    ema_inbetween_state = _clone_state_dict(inbetween_model)
+    ema_inbetween_state = _clone_state_dict(inbetween_model) if inbetween_model is not None else None
     ema_selector_state = _clone_state_dict(keyframe_selector) if selector_has_trainable_params else None
 
     metrics_logger = _init_metrics_logger(
-        'inbetween',
+        'selector' if selector_train_without_diffusion else 'inbetween',
         [
             'step',
             'total_loss',
@@ -1470,14 +1359,18 @@ def train_inbetween(
             'selector_aux',
         ],
     )
-    print(f"In-between metrics CSV: {metrics_logger['csv_path']}")
+    if selector_train_without_diffusion:
+        print(f"Selector metrics CSV: {metrics_logger['csv_path']}")
+    else:
+        print(f"In-between metrics CSV: {metrics_logger['csv_path']}")
 
     start_step = 0
     if resume_ckpt_path and os.path.exists(resume_ckpt_path) and not force_retrain:
         print(f"Resuming In-Betweening from checkpoint: {resume_ckpt_path}")
         inbetween_ckpt = torch.load(resume_ckpt_path, map_location=device)
-        inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
-        if inbetween_ckpt.get('inbetween_ema') is not None:
+        if inbetween_model is not None and inbetween_ckpt.get('inbetween') is not None:
+            inbetween_model.load_state_dict(inbetween_ckpt['inbetween'])
+        if inbetween_model is not None and inbetween_ckpt.get('inbetween_ema') is not None:
             ema_inbetween_state = {k: v.detach().clone() for k, v in inbetween_ckpt['inbetween_ema'].items()}
         if keyframe_selector is not None:
             if inbetween_ckpt.get('selector') is not None:
@@ -1492,7 +1385,10 @@ def train_inbetween(
             except Exception as exc:
                 print(f"Warning: failed to load optimizer state, continuing with fresh optimizer ({exc})")
         if selector_only_training:
-            print('Selector-only training: using resumed diffusion weights as a frozen base and resetting the optimizer step counter.')
+            if selector_train_without_diffusion:
+                print('Selector-only training: resetting the step counter. External CondMDI stays fixed and the local bridge model stays frozen.')
+            else:
+                print('Selector-only training: using resumed diffusion weights as a frozen base and resetting the optimizer step counter.')
             start_step = 0
         else:
             start_step = int(inbetween_ckpt.get('step', 0))
@@ -1513,8 +1409,9 @@ def train_inbetween(
             print(f"Warning: failed to read best checkpoint metadata ({exc})")
 
     if selector_only_training:
-        inbetween_model.eval()
-    else:
+        if inbetween_model is not None:
+            inbetween_model.eval()
+    elif inbetween_model is not None:
         inbetween_model.train()
     if keyframe_selector is not None:
         if selector_has_trainable_params:
@@ -1523,10 +1420,13 @@ def train_inbetween(
             keyframe_selector.eval()
 
     if selector_only_training and not selector_has_trainable_params:
-        print('Selector mode has no trainable parameters; saving a selector-wrapped checkpoint around the frozen base diffusion model.')
+        if selector_train_without_diffusion:
+            print('Selector mode has no trainable parameters; saving a selector-only checkpoint that references the external CondMDI base.')
+        else:
+            print('Selector mode has no trainable parameters; saving a selector-wrapped checkpoint around the frozen base diffusion model.')
         os.makedirs('checkpoints', exist_ok=True)
         checkpoint_payload = {
-            'inbetween': inbetween_model.state_dict(),
+            'inbetween': inbetween_model.state_dict() if inbetween_model is not None else None,
             'inbetween_ema': ema_inbetween_state,
             'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
             'selector_ema': None,
@@ -1545,10 +1445,16 @@ def train_inbetween(
     grad_accum_steps = max(1, int(cfg.grad_accum_steps))
     
     if keyframe_selector is not None:
-        print(
-            f"Stage 2: Training Diffusion In-Betweening with selector={cfg.selector_mode} "
-            f"(target ratio={cfg.selector_target_ratio})..."
-        )
+        if selector_train_without_diffusion:
+            print(
+                f"Stage 2: Training selector={cfg.selector_mode} against external CondMDI objectives "
+                f"(target ratio={cfg.selector_target_ratio}). Local bridge model is frozen and not optimized."
+            )
+        else:
+            print(
+                f"Stage 2: Training Diffusion In-Betweening with selector={cfg.selector_mode} "
+                f"(target ratio={cfg.selector_target_ratio})..."
+            )
     else:
         if cfg.keyframe_strategy == 'random':
             print(
@@ -1618,6 +1524,7 @@ def train_inbetween(
                 selector_budget_weight=selector_budget_weight,
                 selector_entropy_weight=selector_entropy_weight,
                 selector_oracle_target=selector_oracle_target,
+                selector_train_without_diffusion=selector_train_without_diffusion,
             )
             loss = out['loss']
             (loss / grad_accum_steps).backward()
@@ -1646,16 +1553,18 @@ def train_inbetween(
             selector_entropy_avg = selector_entropy_running / selector_metric_count
             selector_aux_avg = selector_aux_running / selector_metric_count
 
-        _update_ema_state(ema_inbetween_state, inbetween_model, cfg.ema_decay)
+        if ema_inbetween_state is not None and inbetween_model is not None:
+            _update_ema_state(ema_inbetween_state, inbetween_model, cfg.ema_decay)
         if selector_has_trainable_params and keyframe_selector is not None and ema_selector_state is not None:
             _update_ema_state(ema_selector_state, keyframe_selector, cfg.ema_decay)
 
         val_loss = None
         if val_loader is not None and step % cfg.val_interval == 0:
-            eval_inbetween_orig = _clone_state_dict(inbetween_model)
+            eval_inbetween_orig = _clone_state_dict(inbetween_model) if inbetween_model is not None else None
             eval_selector_orig = _clone_state_dict(keyframe_selector) if keyframe_selector is not None else None
             if cfg.use_ema_for_sampling:
-                inbetween_model.load_state_dict(ema_inbetween_state)
+                if inbetween_model is not None and ema_inbetween_state is not None:
+                    inbetween_model.load_state_dict(ema_inbetween_state)
                 if selector_has_trainable_params and keyframe_selector is not None and ema_selector_state is not None:
                     keyframe_selector.load_state_dict(ema_selector_state)
 
@@ -1671,7 +1580,8 @@ def train_inbetween(
                 selector_oracle_targets=val_selector_oracle_targets,
             )
 
-            inbetween_model.load_state_dict(eval_inbetween_orig)
+            if inbetween_model is not None and eval_inbetween_orig is not None:
+                inbetween_model.load_state_dict(eval_inbetween_orig)
             if keyframe_selector is not None and eval_selector_orig is not None:
                 keyframe_selector.load_state_dict(eval_selector_orig)
 
@@ -1680,11 +1590,11 @@ def train_inbetween(
                 best_step = step
                 os.makedirs('checkpoints', exist_ok=True)
                 torch.save({
-                    'inbetween': inbetween_model.state_dict(),
+                    'inbetween': inbetween_model.state_dict() if inbetween_model is not None else None,
                     'inbetween_ema': ema_inbetween_state,
                     'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
                     'selector_ema': ema_selector_state if selector_has_trainable_params else None,
-                    'optimizer': inbetween_optimizer.state_dict(),
+                    'optimizer': inbetween_optimizer.state_dict() if inbetween_optimizer is not None else None,
                     'step': step,
                     'best_step': best_step,
                     'best_val_loss': best_val_loss,
@@ -1719,17 +1629,30 @@ def train_inbetween(
                     f"ETA: {eta_hours}h {eta_minutes}m"
                 )
             else:
-                print(
-                    f"step {step:>7d} | loss {total_loss_avg:.5f} | "
-                    f"sel_ratio {selector_ratio_avg:.4f} | "
-                    f"sel_budget {selector_budget_avg:.5f} | "
-                    f"sel_entropy {selector_entropy_avg:.5f} | "
-                    f"sel_aux {selector_aux_avg:.5f} | "
-                    f"lr_d {(lr_inbetween if lr_inbetween is not None else float('nan')):.2e} | "
-                    f"lr_s {lr_selector if lr_selector is not None else float('nan'):.2e} | "
-                    f"val {val_loss if val_loss is not None else float('nan'):.5f} | "
-                    f"ETA: {eta_hours}h {eta_minutes}m"
-                )
+                if selector_train_without_diffusion:
+                    print(
+                        f"step {step:>7d} | loss {total_loss_avg:.5f} | "
+                        f"sel_ratio {selector_ratio_avg:.4f} | "
+                        f"sel_budget {selector_budget_avg:.5f} | "
+                        f"sel_entropy {selector_entropy_avg:.5f} | "
+                        f"sel_aux {selector_aux_avg:.5f} | "
+                        f"bridge frozen | "
+                        f"lr_selector {lr_selector if lr_selector is not None else float('nan'):.2e} | "
+                        f"val {val_loss if val_loss is not None else float('nan'):.5f} | "
+                        f"ETA: {eta_hours}h {eta_minutes}m"
+                    )
+                else:
+                    print(
+                        f"step {step:>7d} | loss {total_loss_avg:.5f} | "
+                        f"sel_ratio {selector_ratio_avg:.4f} | "
+                        f"sel_budget {selector_budget_avg:.5f} | "
+                        f"sel_entropy {selector_entropy_avg:.5f} | "
+                        f"sel_aux {selector_aux_avg:.5f} | "
+                        f"lr_d {(lr_inbetween if lr_inbetween is not None else float('nan')):.2e} | "
+                        f"lr_s {lr_selector if lr_selector is not None else float('nan'):.2e} | "
+                        f"val {val_loss if val_loss is not None else float('nan'):.5f} | "
+                        f"ETA: {eta_hours}h {eta_minutes}m"
+                    )
 
             _append_metrics_row(metrics_logger, {
                 'step': step,
@@ -1752,37 +1675,37 @@ def train_inbetween(
         if step % 10_000 == 0:
             os.makedirs('checkpoints', exist_ok=True)
             torch.save({
-                'inbetween': inbetween_model.state_dict(),
+                'inbetween': inbetween_model.state_dict() if inbetween_model is not None else None,
                 'inbetween_ema': ema_inbetween_state,
                 'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
                 'selector_ema': ema_selector_state if selector_has_trainable_params else None,
-                'optimizer': inbetween_optimizer.state_dict(),
+                'optimizer': inbetween_optimizer.state_dict() if inbetween_optimizer is not None else None,
                 'step': step,
                 'best_step': best_step,
                 'best_val_loss': best_val_loss,
                 'cfg': cfg.__dict__,
             }, f'checkpoints/{ckpt_prefix}_step{step}.pt')
-            print('Saved in-betweening checkpoint')
+            print('Saved selector checkpoint' if selector_train_without_diffusion else 'Saved in-betweening checkpoint')
 
     os.makedirs('checkpoints', exist_ok=True)
     torch.save({
-        'inbetween': inbetween_model.state_dict(),
+        'inbetween': inbetween_model.state_dict() if inbetween_model is not None else None,
         'inbetween_ema': ema_inbetween_state,
         'selector': keyframe_selector.state_dict() if keyframe_selector is not None else None,
         'selector_ema': ema_selector_state if selector_has_trainable_params else None,
-        'optimizer': inbetween_optimizer.state_dict(),
+        'optimizer': inbetween_optimizer.state_dict() if inbetween_optimizer is not None else None,
         'step': cfg.inbetween_steps,
         'best_step': best_step,
         'best_val_loss': best_val_loss,
         'cfg': cfg.__dict__,
     }, inbetween_final_ckpt_path)
-    print(f'Saved final in-betweening checkpoint: {inbetween_final_ckpt_path}')
+    print(f"Saved final {'selector' if selector_train_without_diffusion else 'in-betweening'} checkpoint: {inbetween_final_ckpt_path}")
     if best_step > 0:
         print(f'Best checkpoint: {inbetween_best_ckpt_path} (step={best_step}, val_loss={best_val_loss:.6f})')
     _save_convergence_plot(metrics_logger)
-    print(f"In-between convergence plot: {metrics_logger['plot_path']}")
+    print(f"{'Selector' if selector_train_without_diffusion else 'In-between'} convergence plot: {metrics_logger['plot_path']}")
     
-    print("Diffusion in-betweening training complete!")
+    print('Selector training complete!' if selector_train_without_diffusion else 'Diffusion in-betweening training complete!')
 
 
 if __name__ == '__main__':

@@ -16,13 +16,20 @@ def _project_root() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _preferred_python_executable(root: str) -> str:
+    venv_python = os.path.join(root, ".venv", "Scripts", "python.exe")
+    if os.path.exists(venv_python):
+        return venv_python
+    return sys.executable
+
+
 def _run(script_name: str, script_args: List[str]) -> None:
     root = _project_root()
     script_path = os.path.join(root, script_name)
     if not os.path.exists(script_path):
         raise FileNotFoundError(f"Missing script: {script_path}")
 
-    cmd = [sys.executable, script_path, *script_args]
+    cmd = [_preferred_python_executable(root), script_path, *script_args]
     print("Running:")
     print(" ".join(cmd))
     subprocess.run(cmd, cwd=root, check=True)
@@ -38,9 +45,9 @@ def _write_file(path: str, content: str) -> None:
         f.write(content)
 
 
-def _set_inbetween_config_fields(config_text: str, updates: dict[str, str]) -> str:
-    marker_start = "@dataclass\nclass InbetweenTrainConfig:\n"
-    marker_end = "\n@dataclass\nclass CompositeConfig:"
+def _set_dataclass_fields(config_text: str, class_name: str, next_class_name: str, updates: dict[str, str]) -> str:
+    marker_start = f"@dataclass\nclass {class_name}:\n"
+    marker_end = f"\n@dataclass\nclass {next_class_name}:"
 
     start_idx = config_text.find(marker_start)
     end_idx = config_text.find(marker_end)
@@ -56,9 +63,17 @@ def _set_inbetween_config_fields(config_text: str, updates: dict[str, str]) -> s
         replacement = rf"\1{value}"
         body, n = re.subn(pattern, replacement, body, count=1, flags=re.MULTILINE)
         if n != 1:
-            raise ValueError(f"Could not update field {key!r} in InbetweenTrainConfig")
+            raise ValueError(f"Could not update field {key!r} in {class_name}")
 
     return head + body + tail
+
+
+def _set_inbetween_config_fields(config_text: str, updates: dict[str, str]) -> str:
+    return _set_dataclass_fields(config_text, 'InbetweenTrainConfig', 'SelectorTrainConfig', updates)
+
+
+def _set_selector_config_fields(config_text: str, updates: dict[str, str]) -> str:
+    return _set_dataclass_fields(config_text, 'SelectorTrainConfig', 'CompositeConfig', updates)
 
 
 def _quote_py_string(value: str) -> str:
@@ -86,6 +101,25 @@ def _resolve_existing_checkpoint(root: str, ckpt_prefix: str) -> str | None:
     return None
 
 
+def _default_condmdi_oracle_checkpoint(root: str) -> str:
+    candidate = os.path.abspath(
+        os.path.join(
+            root,
+            "..",
+            "diffusion-motion-inbetweening",
+            "save",
+            "condmdi_randomframes",
+            "model000750000.pt",
+        )
+    )
+    if not os.path.exists(candidate):
+        raise FileNotFoundError(
+            "Oracle-backed selector modes require the CondMDI checkpoint at "
+            f"{candidate}, but it was not found."
+        )
+    return candidate
+
+
 def _run_train_selectors_all(args: argparse.Namespace) -> None:
     root = _project_root()
     config_path = os.path.join(root, "config.py")
@@ -96,44 +130,25 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
 
     train_plan = [
         {
-            "name": "heuristic",
-            "selector_enabled": False,
-            "selector_mode": "text_alignment",
-            "ckpt_prefix": "composite_inbetween_heuristic",
-            "uses_oracle": False,
-            "resume_from_bootstrap": False,
-        },
-        {
             "name": "text_alignment",
             "selector_enabled": True,
             "selector_mode": "text_alignment",
-            "ckpt_prefix": "composite_inbetween_text_alignment",
+            "ckpt_prefix": "composite_selector_text_alignment",
             "uses_oracle": False,
-            "resume_from_bootstrap": True,
-        },
-        {
-            "name": "saliency",
-            "selector_enabled": True,
-            "selector_mode": "saliency",
-            "ckpt_prefix": "composite_inbetween_saliency",
-            "uses_oracle": False,
-            "resume_from_bootstrap": True,
         },
         {
             "name": "information_gain",
             "selector_enabled": True,
             "selector_mode": "information_gain",
-            "ckpt_prefix": "composite_inbetween_information_gain",
+            "ckpt_prefix": "composite_selector_information_gain",
             "uses_oracle": True,
-            "resume_from_bootstrap": True,
         },
         {
             "name": "retrieval_gain",
             "selector_enabled": True,
             "selector_mode": "retrieval_gain",
-            "ckpt_prefix": "composite_inbetween_retrieval_gain",
+            "ckpt_prefix": "composite_selector_retrieval_gain",
             "uses_oracle": True,
-            "resume_from_bootstrap": True,
         },
     ]
 
@@ -152,31 +167,7 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
     if not train_plan:
         raise ValueError("No training runs selected.")
 
-    oracle_override = args.oracle_ckpt.strip() if args.oracle_ckpt else None
-    if oracle_override:
-        oracle_override = os.path.abspath(os.path.join(root, oracle_override))
-
-    bootstrap_oracle_path = oracle_override
-    bootstrap_oracle_prefix = "composite_inbetween_heuristic"
-    if bootstrap_oracle_path is None:
-        bootstrap_oracle_path = _resolve_existing_checkpoint(root, bootstrap_oracle_prefix)
-
-    needs_oracle = any(item["uses_oracle"] for item in train_plan)
-    has_bootstrap_run = any(item["ckpt_prefix"] == bootstrap_oracle_prefix for item in train_plan)
-    needs_bootstrap = any(item["resume_from_bootstrap"] for item in train_plan)
-    if needs_bootstrap and bootstrap_oracle_path is None and not has_bootstrap_run:
-        train_plan = [
-            {
-                "name": "heuristic",
-                "selector_enabled": False,
-                "selector_mode": "text_alignment",
-                "ckpt_prefix": bootstrap_oracle_prefix,
-                "uses_oracle": False,
-                "resume_from_bootstrap": False,
-            },
-            *train_plan,
-        ]
-        print("Inserted heuristic bootstrap run so selector strategies can train around a single shared diffusion base.")
+    condmdi_oracle_path = _default_condmdi_oracle_checkpoint(root)
 
     try:
         for idx, run_cfg in enumerate(train_plan, start=1):
@@ -184,44 +175,23 @@ def _run_train_selectors_all(args: argparse.Namespace) -> None:
 
             selector_oracle_ckpt_value = "None"
             if run_cfg["uses_oracle"]:
-                if bootstrap_oracle_path is None:
-                    raise FileNotFoundError(
-                        "Oracle-backed selector modes require a bootstrap checkpoint, but none was available. "
-                        "Run text_alignment first or pass --oracle-ckpt explicitly."
-                    )
-                selector_oracle_ckpt_value = _quote_py_string(bootstrap_oracle_path)
+                selector_oracle_ckpt_value = _quote_py_string(condmdi_oracle_path)
 
-            updated_config = _set_inbetween_config_fields(
+            updated_config = _set_selector_config_fields(
                 original_config,
                 {
-                    "freeze_inbetween_for_selector": "True" if run_cfg["resume_from_bootstrap"] else "False",
-                    "use_learned_keyframe_selector": "True" if run_cfg["selector_enabled"] else "False",
                     "selector_mode": _quote_py_string(run_cfg["selector_mode"]),
                     "selector_oracle_ckpt_path": selector_oracle_ckpt_value,
+                    "external_inbetween_ckpt_path": _quote_py_string(condmdi_oracle_path),
                 },
             )
             _write_file(config_path, updated_config)
 
-            script_args: List[str] = ["--inbetween-ckpt-prefix", run_cfg["ckpt_prefix"]]
-            if run_cfg["resume_from_bootstrap"]:
-                if bootstrap_oracle_path is None:
-                    raise FileNotFoundError(
-                        "Selector strategy training requires the shared heuristic diffusion checkpoint, but it was not found."
-                    )
-                script_args.extend(["--inbetween-resume", bootstrap_oracle_path])
+            script_args: List[str] = ["--selector-ckpt-prefix", run_cfg["ckpt_prefix"]]
             if args.force:
                 script_args.insert(0, "--force")
 
-            _run("train.py", script_args)
-
-            if run_cfg["ckpt_prefix"] == bootstrap_oracle_prefix and oracle_override is None:
-                discovered = _resolve_existing_checkpoint(root, bootstrap_oracle_prefix)
-                if discovered is None:
-                    raise FileNotFoundError(
-                        "Bootstrap training completed but no checkpoint was found to bootstrap oracle-backed selector modes."
-                    )
-                bootstrap_oracle_path = discovered
-                print(f"Using heuristic random-keyframe checkpoint as oracle bootstrap: {bootstrap_oracle_path}")
+            _run("selector_train.py", script_args)
 
     finally:
         if args.keep_config:
@@ -237,27 +207,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    train = sub.add_parser("train", help="Run in-between training via train.py")
+    train = sub.add_parser("train", help="Legacy local diffusion training entrypoint (removed)")
     train.add_argument("--force", action="store_true")
     train.add_argument("--inbetween-resume", type=str, default=None)
     train.add_argument("--inbetween-ckpt-prefix", type=str, default=None)
 
     train_all = sub.add_parser(
         "train-selectors-all",
-        help="Train heuristic + all learned selector modes sequentially",
+        help="Train external-CondMDI-backed selector modes sequentially",
     )
     train_all.add_argument("--force", action="store_true")
-    train_all.add_argument(
-        "--oracle-ckpt",
-        type=str,
-        default=None,
-        help="Optional oracle checkpoint path used for information/retrieval gain runs",
-    )
     train_all.add_argument(
         "--only",
         type=str,
         default=None,
-        help="Comma-separated subset: heuristic,text_alignment,saliency,information_gain,retrieval_gain",
+        help="Comma-separated subset: text_alignment,information_gain,retrieval_gain",
     )
     train_all.add_argument(
         "--keep-config",
@@ -355,9 +319,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "train":
-        script_args = _args_to_script_flags(args, {"command"})
-        _run("train.py", script_args)
-        return
+        raise RuntimeError(
+            'The legacy local diffusion training path has been removed. '
+            'Use `python pipeline.py train-selectors-all --force` for selector training against external CondMDI.'
+        )
 
     if args.command == "sample":
         script_args = _args_to_script_flags(args, {"command"})

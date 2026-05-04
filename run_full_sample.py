@@ -303,6 +303,8 @@ def main() -> None:
         keyframe_mask=keyframe_mask_batch,
         guidance_scale=cfg.guidance_scale,
         cond_uncond=cond_uncond,
+        source_motion=ar_motion_norm.unsqueeze(0),
+        text_prompt=args.prompt,
     )[0]
 
     keyframe_idx = keyframe_indices.cpu()
