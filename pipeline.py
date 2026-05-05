@@ -97,21 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     visualize.add_argument("--save-mp4", type=str, default=None)
 
     # ---- Evaluate ----
-    evaluate = sub.add_parser("evaluate", help="Run HumanML3D evaluation via eval_ML3D.py")
-    evaluate.add_argument("--models", type=str, default="composite",
-                          help="Models to evaluate: all, composite, t2mgpt (comma-separated)")
-    evaluate.add_argument("--metrics", type=str, default="all",
-                          help="Metrics to compute: all or comma-separated fid,diversity,jerk,foot_skating,multimodality,multimodal_distance,matching_score,r_precision")
-    evaluate.add_argument("--device", type=str, default=None)
-    evaluate.add_argument("--humanml-root", type=str, default="humanml")
-    evaluate.add_argument("--t2mgpt-root", type=str, default="D:/Projects/T2M-GPT")
-    evaluate.add_argument("--composite-inbetween-ckpt", type=str, default=None)
-    evaluate.add_argument("--arlm-vq-ckpt", type=str, default=None)
-    evaluate.add_argument("--arlm-gpt-ckpt", type=str, default=None)
-    evaluate.add_argument("--results-dir", type=str, default="samples/eval_results")
-    evaluate.add_argument("--results-path", type=str, default=None)
-    evaluate.add_argument("--load-results", action="store_true")
-    evaluate.add_argument("--save-results", action="store_true")
+    evaluate = sub.add_parser("evaluate", help="Run HumanML3D evaluation via eval.py")
 
     return parser
 
@@ -180,7 +166,7 @@ def main() -> None:
 
     if args.command == "evaluate":
         script_args = _args_to_script_flags(args, {"command"})
-        _run("eval_ML3D.py", script_args)
+        _run("eval.py", script_args)
         return
 
     raise ValueError(f"Unknown command: {args.command}")

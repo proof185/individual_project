@@ -27,3 +27,5 @@ sample_composite_*.npy
 checkpoints/
 old_checkpoints/
 TRAIN_ALL_GEN/
+training_logs/
+samples/

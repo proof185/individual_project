@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from config import ReconstructionTrainConfig
 from condmdi_adapter import load_external_condmdi_runtime
 from dataset import HUMANML3DCompositeDataset, collate_composite
-from models.selector_modules import SELECTOR_MODE_CHOICES, build_keyframe_selector
+from keyframe_selectors import SELECTOR_MODE_CHOICES, build_keyframe_selector
 from utils import encode_text, encode_text_with_tokens, setup_clip_model
 
 
@@ -351,7 +351,10 @@ def main(
     if cfg.selector_mode not in SELECTOR_MODE_CHOICES:
         raise ValueError(f"Unknown selector mode {cfg.selector_mode!r}. Expected one of {SELECTOR_MODE_CHOICES}.")
     if cfg.selector_mode != 'reconstruction':
-        raise ValueError('train_reconstruction.py trains only the reconstruction selector. Use random/uniform/saliency as baselines.')
+        raise ValueError(
+            'train_reconstruction.py trains only the reconstruction selector. '
+            'Use random/interval/energy/pose_extrema/interpolation_error/contact_transition as baselines.'
+        )
     if condmdi_ckpt:
         cfg.external_inbetween_ckpt_path = condmdi_ckpt
 
@@ -393,18 +396,9 @@ def main(
         normalize=True,
         use_cache=True,
         text_encoder=text_encoder,
-        keyframe_interval=5,
-        keyframe_strategy=cfg.keyframe_strategy,
-        keyframe_count=None,
-        keyframe_min=8,
-        keyframe_max=28,
-        keyframe_include_ends=True,
-        include_keyframes=True,
-        conditioning_motion_dir=None,
         mean=mean,
         std=std,
         device=device,
-        load_token_embeddings=False,
     )
     print('Dataset size:', len(dataset))
 
@@ -419,17 +413,9 @@ def main(
             normalize=True,
             use_cache=True,
             text_encoder=text_encoder,
-            keyframe_interval=5,
-            keyframe_strategy=cfg.keyframe_strategy,
-            keyframe_count=None,
-            keyframe_min=8,
-            keyframe_max=28,
-            keyframe_include_ends=True,
-            conditioning_motion_dir=None,
             mean=mean,
             std=std,
             device=device,
-            load_token_embeddings=False,
         )
         val_loader_kwargs = {
             'batch_size': min(cfg.val_batch_size, cfg.batch_size),

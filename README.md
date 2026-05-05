@@ -20,7 +20,7 @@ This version documents the code exactly as it is now.
 ### What is currently incomplete or externally required
 
 - `pipeline.py train` has been removed from the CLI
-- `run_full_sample.py` and `eval_ML3D.py` import `arlm_generate` symbols, but `arlm_generate.py` is not present in this checkout
+- `run_full_sample.py` imports `arlm_generate` at startup; `eval.py` loads it lazily when generation starts, but `arlm_generate.py` is not present in this checkout
 - `pipeline.py arlm-generate` and `pipeline.py finetune` reference scripts that are not present locally
 
 If you plan to use sample generation/evaluation from this repo directly, restore the missing scripts or vendor those imports from your external codebase first.
@@ -81,13 +81,19 @@ Current caveat: `run_full_sample.py` imports `ARLMConfig` / `_load_arlm_models` 
 
 ### `evaluate` (depends on missing local module)
 
-Routes to `eval_ML3D.py`.
+Routes to `eval.py`.
 
 ```bash
-python pipeline.py evaluate --models composite
+python pipeline.py evaluate
 ```
 
-Current caveat: `eval_ML3D.py` imports `ARLMConfig` / `_load_arlm_models` from `arlm_generate`, which is not present in this repository tree.
+Evaluation settings live in `EvalConfig` in `config.py`. By default this uses
+1000 test samples, compares unmodified T2M-GPT against all selector strategies
+(`random`, `interval`, `energy`, `pose_extrema`, `interpolation_error`,
+`contact_transition`, `reconstruction`), and writes a CSV metrics table.
+Current caveat: runtime T2M-GPT generation still requires `ARLMConfig` /
+`_load_arlm_models` from `arlm_generate`, which is not present in this
+repository tree.
 
 ### `train` (removed)
 
@@ -123,10 +129,11 @@ Checkpoint names are always derived from `selector_mode` in `ReconstructionTrain
 Core runtime defaults live in `config.py`:
 
 - `ReconstructionTrainConfig`: reconstruction selector training setup
-- `InbetweenTrainConfig`: legacy/full in-between training config block
 - `CompositeConfig`: inference/eval/default model settings
+- `EvalConfig`: evaluation defaults, metrics, paths, and checkpoint overrides
 
-For this project state, prefer changing selector-related defaults in `ReconstructionTrainConfig`.
+For this project state, prefer changing evaluation runs in `EvalConfig` and
+selector-training defaults in `ReconstructionTrainConfig`.
 
 ## Outputs
 
@@ -145,10 +152,10 @@ Visualization outputs depend on CLI args and may include rendered files such as 
 | `train_reconstruction.py` | Reconstruction selector training loop (external CondMDI-backed) |
 | `config.py` | Dataclass configs for training/eval/inference |
 | `run_full_sample.py` | Sample generation entry (currently depends on missing local `arlm_generate`) |
-| `eval_ML3D.py` | Evaluation entry (currently depends on missing local `arlm_generate`) |
+| `eval.py` | Evaluation entry (currently depends on missing local `arlm_generate`) |
 | `visualize.py` | Motion visualization utilities |
 | `condmdi_adapter.py` | Adapter for external CondMDI checkpoint usage |
-| `models/selector_modules/` | Selector implementations and factory (`build_keyframe_selector`) |
+| `keyframe_selectors/` | Selector implementations and factory (`build_keyframe_selector`) |
 
 ## Environment Notes
 

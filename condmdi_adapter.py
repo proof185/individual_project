@@ -310,10 +310,7 @@ class ExternalCondMDIDiffusionAdapter:
             )
 
         with _temporary_condmdi_imports(self.condmdi_root):
-            source_rel = source_motion.permute(0, 2, 1).unsqueeze(2)
-            source_rel = source_rel * (self.local_std + 1e-8) + self.local_mean
-            source_abs = self._relative_to_absolute_root(source_rel)
-            source_abs_norm = (source_abs - self.abs_mean) / (self.abs_std + 1e-8)
+            source_abs_norm = self._normalize_local_to_abs(source_motion)
 
             padded_source = torch.zeros(batch_size, feature_dim, 1, self.max_frames, device=self.device)
             padded_source[:, :, :, :time_steps] = source_abs_norm
@@ -360,10 +357,7 @@ class ExternalCondMDIDiffusionAdapter:
                 const_noise=False,
             )
             sampled_abs = sampled_abs[:, :, :, :time_steps]
-            sampled_abs = sampled_abs * (self.abs_std + 1e-8) + self.abs_mean
-            sampled_rel = self._absolute_to_relative_root(sampled_abs)
-            sampled_rel_norm = (sampled_rel - self.local_mean) / (self.local_std + 1e-8)
-            return sampled_rel_norm.squeeze(2).permute(0, 2, 1).contiguous()
+            return self._denormalize_abs_to_local(sampled_abs)
 
 
 def load_external_condmdi_runtime(
