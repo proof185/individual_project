@@ -83,7 +83,7 @@ class EvalConfig:
     # Evaluation set
     num_samples: int = 1000
     batch_size: int = 8
-    num_workers: int = 4
+    num_workers: int = 0
     pin_memory: bool = True
     seed: int = 1234
     device: str | None = None
@@ -92,8 +92,8 @@ class EvalConfig:
     humanml_root: str = 'humanml'
     t2mgpt_root: str = 'D:/Projects/T2M-GPT'
 
-    # Compare unmodified T2M-GPT against all keyframe selection strategies.
-    models: str = 't2mgpt,composite'
+    # Compare unmodified T2M-GPT against explicit keyframe selection strategies.
+    models: str = 'reconstruction, random, interval, energy, pose_extrema, interpolation_error, contact_transition'
     metrics: str = 'fid,diversity,matching_score,r_precision,jerk,foot_skating'
     r_precision_top_k: str = '1,2,3,5'
 
@@ -112,7 +112,11 @@ class EvalConfig:
     # CondMDI / selector checkpoints
     composite_inbetween_ckpt: str | None = None
     composite_reconstruction_ckpt: str | None = None
+    condmdi_unconditional_ckpt: str = '../diffusion-motion-inbetweening/save/condmdi_uncond/model000500000.pt'
     disable_reconstruction_selector: bool = False
+
+    # Diffusion sampling
+    ddim_steps: int = 50
 
     # Keyframe selection
     fallback_keyframe_strategy: str | None = None

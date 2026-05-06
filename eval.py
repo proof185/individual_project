@@ -14,14 +14,17 @@ import types
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import numpy as np
 import torch
 from scipy import linalg
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from config import CompositeConfig, EvalConfig
+from condmdi_adapter import load_external_condmdi_runtime
 from keyframe_selectors import SELECTOR_MODE_CHOICES, build_keyframe_selector
 from utils import encode_text, load_inbetween_model, select_keyframe_indices
 
@@ -31,9 +34,27 @@ COMPOSITE_SELECTOR_MODES = tuple(SELECTOR_MODE_CHOICES)
 COMPOSITE_MODEL_ALIASES = {
     "composite_heuristic": "composite_random",
 }
+SELECTION_STRATEGY_ALIASES = {
+    mode: f"composite_{mode}" for mode in COMPOSITE_SELECTOR_MODES
+}
+CONDMDI_UNCONDITIONAL_MODEL = "condmdi_unconditional"
+CONDMDI_UNCONDITIONAL_ALIASES = {
+    "condmdi_uncond": CONDMDI_UNCONDITIONAL_MODEL,
+    "condmdi_text_only": CONDMDI_UNCONDITIONAL_MODEL,
+    "condmdi": CONDMDI_UNCONDITIONAL_MODEL,
+}
+T2MGPT_ALIASES = {
+    "gpt": "t2mgpt",
+    "t2m-gpt": "t2mgpt",
+    "t2m_gpt": "t2mgpt",
+}
 _INBETWEEN_RUNTIME_CACHE: dict[
     tuple[str, str, str],
     tuple[object, object, object, torch.Tensor, torch.Tensor, int],
+] = {}
+_CONDMDI_TEXT_RUNTIME_CACHE: dict[
+    tuple[str, str, str],
+    tuple[object, object, torch.Tensor, torch.Tensor, int],
 ] = {}
 
 
@@ -41,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the configured HumanML3D evaluation and write a CSV summary."
     )
+    parser.add_argument("--seed", type=int, default=None, help="Override EvalConfig.seed")
     return parser.parse_args()
 
 
@@ -58,21 +80,23 @@ def parse_csv(value: str) -> list[str]:
 
 def resolve_models(value: str) -> list[str]:
     composite_variants = [f"composite_{mode}" for mode in COMPOSITE_SELECTOR_MODES]
+    strategy_names = ", ".join(COMPOSITE_SELECTOR_MODES)
     requested = []
     for model_name in parse_csv(value.lower()):
         model_name = COMPOSITE_MODEL_ALIASES.get(model_name, model_name)
+        model_name = CONDMDI_UNCONDITIONAL_ALIASES.get(model_name, model_name)
+        model_name = T2MGPT_ALIASES.get(model_name, model_name)
+        model_name = SELECTION_STRATEGY_ALIASES.get(model_name, model_name)
         if model_name == "all":
-            requested.extend(["t2mgpt", *composite_variants])
+            requested.extend(["t2mgpt", CONDMDI_UNCONDITIONAL_MODEL, *composite_variants])
         elif model_name == "composite":
             requested.extend(composite_variants)
-        elif model_name == "gpt":
-            requested.append("t2mgpt")
-        elif model_name in {"t2mgpt", *composite_variants}:
+        elif model_name in {"t2mgpt", CONDMDI_UNCONDITIONAL_MODEL, *composite_variants}:
             requested.append(model_name)
         else:
             raise ValueError(
                 f"Unsupported model name: {model_name}. "
-                f"Use t2mgpt, composite, all, or one of {composite_variants}."
+                f"Use t2mgpt, {CONDMDI_UNCONDITIONAL_MODEL}, all, or one of these selection strategies: {strategy_names}."
             )
     if not requested:
         raise ValueError("No models selected for evaluation")
@@ -108,9 +132,10 @@ def ensure_results_path(cfg: EvalConfig) -> str:
     if cfg.results_path:
         return os.path.abspath(cfg.results_path)
     os.makedirs(cfg.results_dir, exist_ok=True)
-    model_tag = "-".join(resolve_models(cfg.models))
+    resolved = resolve_models(cfg.models)
+    model_tag = "-".join(resolved) if len("-".join(resolved)) <= 50 else f"{len(resolved)}models"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.abspath(os.path.join(cfg.results_dir, f"eval_{model_tag}_{stamp}.json"))
+    return os.path.abspath(os.path.join(cfg.results_dir, f"eval_{model_tag}_seed{cfg.seed}_{stamp}.json"))
 
 
 def ensure_csv_path(cfg: EvalConfig, results_path: str) -> str:
@@ -148,20 +173,25 @@ def _extract_step_from_path(path: str | None) -> int | None:
     return None
 
 
+def _project_path(*parts: str) -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), *parts))
+
+
 def _default_inbetween_ckpt() -> str:
     preferred = [
-        os.path.join("checkpoints", "finetuned_inbetween_best.pt"),
-        os.path.join("checkpoints", "composite_inbetween_best.pt"),
+        _project_path("checkpoints", "finetuned_inbetween_best.pt"),
+        _project_path("checkpoints", "composite_inbetween_best.pt"),
+        _project_path("..", "diffusion-motion-inbetweening", "save", "condmdi_randomframes", "model000750000.pt"),
     ]
     for path in preferred:
         if os.path.exists(path):
             return path
 
     step = _latest_step(
-        checkpoint_glob=os.path.join("checkpoints", "composite_inbetween_step*.pt"),
+        checkpoint_glob=_project_path("checkpoints", "composite_inbetween_step*.pt"),
         prefix="composite_inbetween_step",
     )
-    return os.path.join("checkpoints", f"composite_inbetween_step{step}.pt")
+    return _project_path("checkpoints", f"composite_inbetween_step{step}.pt")
 
 
 def _resolve_arlm_ckpts(
@@ -191,14 +221,70 @@ def _load_arlm_stats(t2mgpt_root: str, device: torch.device) -> tuple[torch.Tens
     return mean, std, meta_dir
 
 
-def _load_arlm_runtime():
+def _load_arlm_runtime(t2mgpt_root: str):
     try:
         from arlm_generate import ARLMConfig, _load_arlm_models  # type: ignore
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "eval.py requires arlm_generate.py for T2M-GPT generation. "
-            "Add that module to this checkout or update eval.py to point at your T2M-GPT loader."
-        ) from exc
+        return ARLMConfig, _load_arlm_models
+    except ModuleNotFoundError:
+        pass
+
+    prepare_t2mgpt_imports(t2mgpt_root)
+    with pushd(t2mgpt_root):
+        import clip as clip_lib  # type: ignore
+        from models.t2m_trans import Text2Motion_Transformer  # type: ignore
+        from models.vqvae import HumanVQVAE  # type: ignore
+
+    @dataclass
+    class ARLMConfig:
+        pass
+
+    def _load_arlm_models(
+        root: str,
+        cfg: ARLMConfig,
+        vq_ckpt: str,
+        gpt_ckpt: str,
+        device: torch.device,
+    ):
+        del cfg
+        prepare_t2mgpt_imports(root)
+        with pushd(root):
+            model_cfg = SimpleNamespace(dataname="t2m", quantizer="ema_reset", mu=0.99)
+            vq_model = HumanVQVAE(
+                model_cfg,
+                nb_code=512,
+                code_dim=512,
+                output_emb_width=512,
+                down_t=2,
+                stride_t=2,
+                width=512,
+                depth=3,
+                dilation_growth_rate=3,
+            ).to(device)
+            gpt_model = Text2Motion_Transformer(
+                num_vq=512,
+                embed_dim=1024,
+                clip_dim=512,
+                block_size=51,
+                num_layers=9,
+                n_head=16,
+                drop_out_rate=0.1,
+                fc_rate=4,
+            ).to(device)
+
+            vq_state = torch.load(vq_ckpt, map_location="cpu")
+            gpt_state = torch.load(gpt_ckpt, map_location="cpu")
+            vq_model.load_state_dict(vq_state["net"], strict=True)
+            gpt_model.load_state_dict(gpt_state["trans"], strict=True)
+            vq_model.eval()
+            gpt_model.eval()
+
+            clip_model, _ = clip_lib.load("ViT-B/32", device=device, jit=False)
+            clip_lib.model.convert_weights(clip_model)
+            clip_model.eval()
+            for param in clip_model.parameters():
+                param.requires_grad = False
+        return clip_lib, clip_model, vq_model, gpt_model
+
     return ARLMConfig, _load_arlm_models
 
 
@@ -267,7 +353,7 @@ def build_eval_loader_and_wrapper(
     t2mgpt_root: str,
     batch_size: int,
     device: torch.device,
-    num_workers: int = 4,
+    num_workers: int = 0,
     pin_memory: bool = True,
 ):
     prepare_t2mgpt_imports(t2mgpt_root)
@@ -466,7 +552,7 @@ class T2MGPTMotionSource:
     ):
         self.device = device
         self.t2mgpt_root = os.path.abspath(t2mgpt_root)
-        ARLMConfig, load_arlm_models = _load_arlm_runtime()
+        ARLMConfig, load_arlm_models = _load_arlm_runtime(self.t2mgpt_root)
         self.arlm_cfg = ARLMConfig()
         vq_ckpt, gpt_ckpt = _resolve_arlm_ckpts(self.t2mgpt_root, arlm_vq_ckpt, arlm_gpt_ckpt)
         self.clip_lib, self.clip_model, self.vq_model, self.gpt_model = load_arlm_models(
@@ -513,6 +599,7 @@ class CompositeStrategy:
         include_ends: bool,
         keyframe_topk: int | None,
         keyframe_budget_ratio: float,
+        ddim_steps: int = 50,
     ):
         self.name = name
         self.device = device
@@ -523,7 +610,7 @@ class CompositeStrategy:
         self.keyframe_budget_ratio = float(keyframe_budget_ratio)
 
         if inbetween_ckpt is None:
-            resolved_ckpt = _default_inbetween_ckpt_for_mode(selector_mode)
+            resolved_ckpt = os.path.abspath(_default_inbetween_ckpt_for_mode(selector_mode))
         else:
             resolved_ckpt = os.path.abspath(inbetween_ckpt)
 
@@ -544,12 +631,13 @@ class CompositeStrategy:
         if disable_selector and selector_mode == "reconstruction":
             cfg.use_learned_keyframe_selector = False
         self.cfg = cfg
-        cache_key = (resolved_ckpt, str(device), os.path.abspath(humanml_root))
+        cache_key = (resolved_ckpt, str(device), os.path.abspath(humanml_root), int(ddim_steps))
         if cache_key not in _INBETWEEN_RUNTIME_CACHE:
             _INBETWEEN_RUNTIME_CACHE[cache_key] = load_inbetween_model(
                 cfg,
                 str(device),
                 inbetween_ckpt_path=resolved_ckpt,
+                ddim_steps=int(ddim_steps),
             )
         self.inbetween_model, self.diff_inbetween, self.clip_model, local_mean, local_std, self.fdim = _INBETWEEN_RUNTIME_CACHE[cache_key]
         self.local_mean = local_mean.to(device)
@@ -632,6 +720,42 @@ class CompositeStrategy:
             keyframe_indices=keyframe_indices,
         )
 
+    def sample_batch_conditioned(self, conditionings: list[CompositeConditioning]) -> list[np.ndarray]:
+        lengths = [int(c.ar_motion_norm.shape[0]) for c in conditionings]
+        max_len = max(lengths)
+        batch_size = len(conditionings)
+
+        source_motion = torch.zeros(batch_size, max_len, self.fdim, device=self.device)
+        valid_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=self.device)
+        for i, (c, length) in enumerate(zip(conditionings, lengths)):
+            source_motion[i, :length] = c.ar_motion_norm
+            valid_mask[i, :length] = True
+
+        max_kf = max(c.keyframe_indices.numel() for c in conditionings)
+        keyframe_indices = torch.zeros(batch_size, max_kf, dtype=torch.long, device=self.device)
+        keyframe_mask = torch.zeros(batch_size, max_kf, dtype=torch.bool, device=self.device)
+        for i, c in enumerate(conditionings):
+            n = c.keyframe_indices.numel()
+            keyframe_indices[i, :n] = c.keyframe_indices
+            keyframe_mask[i, :n] = True
+
+        sampled_norm = self.diff_inbetween.sample_inbetween(
+            model=self.inbetween_model,
+            shape=(batch_size, max_len, self.fdim),
+            cond=None,
+            mask=valid_mask,
+            keyframe_indices=keyframe_indices,
+            keyframe_mask=keyframe_mask,
+            guidance_scale=self.diff_guidance,
+            source_motion=source_motion,
+            text_prompt=[c.prompt for c in conditionings],
+        )
+        return [
+            (sampled_norm[i, :lengths[i]] * (self.local_std + 1e-8) + self.local_mean)
+            .detach().cpu().numpy().astype(np.float32)
+            for i in range(batch_size)
+        ]
+
     def sample_conditioned(self, conditioning: CompositeConditioning) -> np.ndarray:
         ar_motion_norm = conditioning.ar_motion_norm
         keyframe_indices = conditioning.keyframe_indices
@@ -658,6 +782,63 @@ class CompositeStrategy:
 
     def generate_from_ar(self, prompt: str, ar_motion: GeneratedARMotion) -> np.ndarray:
         return self.sample_conditioned(self.prepare_conditioning(prompt, ar_motion))
+
+
+class CondMDITextOnlyStrategy:
+    def __init__(
+        self,
+        name: str,
+        humanml_root: str,
+        device: torch.device,
+        checkpoint_path: str,
+        guidance_scale: float,
+        ddim_steps: int = 50,
+    ):
+        self.name = name
+        self.device = device
+        self.guidance_scale = float(guidance_scale)
+
+        mean_path = os.path.join(humanml_root, "Mean.npy")
+        std_path = os.path.join(humanml_root, "Std.npy")
+        local_mean = torch.from_numpy(np.load(mean_path)).float().view(-1)
+        local_std = torch.from_numpy(np.load(std_path)).float().view(-1)
+        self.local_mean = local_mean.to(device)
+        self.local_std = local_std.to(device)
+        self.fdim = int(local_mean.shape[0])
+
+        resolved_ckpt = os.path.abspath(checkpoint_path)
+        args_path = os.path.join(os.path.dirname(resolved_ckpt), "args.json")
+        if not os.path.exists(resolved_ckpt) or not os.path.exists(args_path):
+            raise FileNotFoundError(
+                "CondMDI unconditional checkpoint is not set up. "
+                "Download the CondMDI unconditional model and place both "
+                f"{os.path.basename(resolved_ckpt)} and args.json in {os.path.dirname(resolved_ckpt)}, "
+                "or update EvalConfig.condmdi_unconditional_ckpt."
+            )
+        cache_key = (resolved_ckpt, str(device), os.path.abspath(humanml_root), int(ddim_steps))
+        if cache_key not in _CONDMDI_TEXT_RUNTIME_CACHE:
+            model, adapter = load_external_condmdi_runtime(
+                checkpoint_path=resolved_ckpt,
+                local_mean=local_mean,
+                local_std=local_std,
+                device=str(device),
+                ddim_steps=int(ddim_steps),
+            )
+            _CONDMDI_TEXT_RUNTIME_CACHE[cache_key] = (model, adapter, local_mean, local_std, self.fdim)
+            print(f"Loaded CondMDI text-only runtime from {resolved_ckpt}")
+        self.model, self.adapter, _, _, _ = _CONDMDI_TEXT_RUNTIME_CACHE[cache_key]
+
+    def sample_batch(self, prompts: list[str], lengths: torch.Tensor) -> list[np.ndarray]:
+        sampled_norm = self.adapter.sample_text_local(
+            text_prompts=prompts,
+            lengths=lengths.to(self.device),
+            guidance_scale=self.guidance_scale,
+        )
+        raw_motion = sampled_norm * (self.local_std + 1e-8) + self.local_mean
+        return [
+            raw_motion[i, : int(lengths[i].item())].detach().cpu().numpy().astype(np.float32)
+            for i in range(raw_motion.shape[0])
+        ]
 
 
 def build_motion_batch(
@@ -773,6 +954,7 @@ def evaluate_models(
     models: list[str],
     ar_source: T2MGPTMotionSource,
     composite_strategies: dict[str, CompositeStrategy],
+    condmdi_text_strategies: dict[str, CondMDITextOnlyStrategy],
     loader: DataLoader,
     eval_wrapper,
     top_k: list[int],
@@ -789,74 +971,79 @@ def evaluate_models(
     }
     processed = 0
 
-    for batch in loader:
-        remaining = num_samples - processed
-        if remaining <= 0:
-            break
-        word_embeddings, pos_one_hots, captions, sent_len, motion, m_length, token, name = batch
-        batch_size = len(captions)
-        if batch_size > remaining:
-            batch = truncate_batch(batch, remaining)
-            word_embeddings, pos_one_hots, captions, sent_len, motion, m_length, token, name = batch
-            batch_size = remaining
+    with tqdm(total=num_samples * len(models), unit="pass", desc="Evaluating") as pbar:
+        for batch in loader:
+            remaining = num_samples - processed
+            if remaining <= 0:
+                break
+            word_embeddings, pos_one_hots, captions, sent_len, motion, m_length, _, _ = batch
+            batch_size = len(captions)
+            if batch_size > remaining:
+                batch = truncate_batch(batch, remaining)
+                word_embeddings, pos_one_hots, captions, sent_len, motion, m_length, _, _ = batch
+                batch_size = remaining
 
-        captions = list(captions)
-        motion = motion.to(device).float()
-        m_length = m_length.to(device).long()
+            captions = list(captions)
+            motion = motion.to(device).float()
+            m_length = m_length.to(device).long()
 
-        text_embeddings, gt_embeddings = eval_wrapper.get_co_embeddings(
-            word_embeddings,
-            pos_one_hots,
-            sent_len,
-            motion,
-            m_length,
-        )
-
-        base_ar_motions = [
-            ar_source.generate(caption, stochastic=bool(categorical_sample))
-            for caption in captions
-        ]
-
-        for model_name in models:
-            if model_name == "t2mgpt":
-                raw_motions = [motion.raw_motion for motion in base_ar_motions]
-            else:
-                strategy = composite_strategies[model_name]
-                conditionings = [
-                    strategy.prepare_conditioning(prompt=caption, ar_motion=ar_motion)
-                    for caption, ar_motion in zip(captions, base_ar_motions)
-                ]
-                raw_motions = [strategy.sample_conditioned(conditioning) for conditioning in conditionings]
-
-            motion_batch = build_motion_batch(
-                raw_motions,
-                eval_mean=eval_mean,
-                eval_std=eval_std,
-                need_jerk=("jerk" in metrics),
-                need_foot_skating=("foot_skating" in metrics),
-            )
-            pred_padded = motion_batch.padded.to(device)
-            pred_lengths = motion_batch.lengths.to(device)
-            _, pred_embeddings = eval_wrapper.get_co_embeddings(
+            pbar.set_postfix(model="gt_embed", refresh=True)
+            text_embeddings, gt_embeddings = eval_wrapper.get_co_embeddings(
                 word_embeddings,
                 pos_one_hots,
                 sent_len,
-                pred_padded,
-                pred_lengths,
-            )
-            accumulators[model_name].update_first_pass(
-                text_embeddings=text_embeddings,
-                gt_embeddings=gt_embeddings,
-                pred_embeddings=pred_embeddings,
-                motion_batch=motion_batch,
+                motion,
+                m_length,
             )
 
-        processed += batch_size
-        print(
-            "processed "
-            f"{processed}/{num_samples} samples "
-            f"for {len(models)} models using one shared base T2M-GPT pass"
-        )
+            pbar.set_postfix(model="t2mgpt_gen", refresh=True)
+            base_ar_motions = [
+                ar_source.generate(caption, stochastic=bool(categorical_sample))
+                for caption in captions
+            ]
+
+            model_bar = tqdm(models, desc="  models", leave=False, unit="model")
+            for model_name in model_bar:
+                model_bar.set_description(f"  {model_name}")
+                pbar.set_postfix(model=model_name, refresh=True)
+                if model_name == "t2mgpt":
+                    raw_motions = [motion.raw_motion for motion in base_ar_motions]
+                elif model_name in condmdi_text_strategies:
+                    raw_motions = condmdi_text_strategies[model_name].sample_batch(captions, m_length)
+                else:
+                    strategy = composite_strategies[model_name]
+                    conditionings = [
+                        strategy.prepare_conditioning(prompt=caption, ar_motion=ar_motion)
+                        for caption, ar_motion in zip(captions, base_ar_motions)
+                    ]
+                    raw_motions = strategy.sample_batch_conditioned(conditionings)
+
+                motion_batch = build_motion_batch(
+                    raw_motions,
+                    eval_mean=eval_mean,
+                    eval_std=eval_std,
+                    need_jerk=("jerk" in metrics),
+                    need_foot_skating=("foot_skating" in metrics),
+                )
+                pred_padded = motion_batch.padded.to(device)
+                pred_lengths = motion_batch.lengths.to(device)
+                _, pred_embeddings = eval_wrapper.get_co_embeddings(
+                    word_embeddings,
+                    pos_one_hots,
+                    sent_len,
+                    pred_padded,
+                    pred_lengths,
+                )
+                accumulators[model_name].update_first_pass(
+                    text_embeddings=text_embeddings,
+                    gt_embeddings=gt_embeddings,
+                    pred_embeddings=pred_embeddings,
+                    motion_batch=motion_batch,
+                )
+                pbar.update(batch_size)
+
+            processed += batch_size
+            pbar.set_postfix(model="—", refresh=True)
 
     return {
         model_name: accumulator.finalize()
@@ -878,7 +1065,7 @@ def _flatten_metric_value(prefix: str, value: Any, out: dict[str, Any]) -> None:
 
 
 def write_results_csv(all_results: dict[str, Any], csv_path: str) -> None:
-    rows: list[dict[str, Any]] = []
+    new_rows: list[dict[str, Any]] = []
     metrics = ",".join(all_results.get("metrics", []))
     for model_name, result in all_results.get("models", {}).items():
         row: dict[str, Any] = {
@@ -894,11 +1081,35 @@ def write_results_csv(all_results: dict[str, Any], csv_path: str) -> None:
             if key in {"model", "num_samples"}:
                 continue
             _flatten_metric_value(key, value, row)
-        rows.append(row)
+        new_rows.append(row)
 
-    if not rows:
+    if not new_rows:
         return
 
+    existing_rows: list[dict[str, Any]] = []
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_rows = list(reader)
+
+    rows_by_model = {
+        row.get("model", ""): row
+        for row in existing_rows
+        if row.get("model", "")
+    }
+    model_order = [
+        row.get("model", "")
+        for row in existing_rows
+        if row.get("model", "")
+    ]
+
+    for row in new_rows:
+        model_name = str(row.get("model", ""))
+        if model_name not in rows_by_model:
+            model_order.append(model_name)
+        rows_by_model[model_name] = row
+
+    rows = [rows_by_model[model_name] for model_name in model_order if model_name in rows_by_model]
     fieldnames = sorted({key for row in rows for key in row.keys()})
     preferred = [
         "model",
@@ -959,14 +1170,14 @@ def _default_inbetween_ckpt_for_mode(selector_mode: str) -> str:
 
         return max(step_candidates, key=_extract_step)
 
-    fallback = _default_inbetween_ckpt()
-    print(f"Warning: no mode-specific checkpoint found for selector mode '{mode}', falling back to {fallback}")
-    return fallback
+    return _default_inbetween_ckpt()
 
 
 def main() -> None:
-    parse_args()
+    args = parse_args()
     cfg = EvalConfig()
+    if args.seed is not None:
+        cfg.seed = args.seed
     set_seed(cfg.seed)
 
     device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -1001,6 +1212,17 @@ def main() -> None:
     )
 
     composite_strategies: dict[str, CompositeStrategy] = {}
+    condmdi_text_strategies: dict[str, CondMDITextOnlyStrategy] = {}
+    if CONDMDI_UNCONDITIONAL_MODEL in models:
+        condmdi_text_strategies[CONDMDI_UNCONDITIONAL_MODEL] = CondMDITextOnlyStrategy(
+            name=CONDMDI_UNCONDITIONAL_MODEL,
+            humanml_root=cfg.humanml_root,
+            device=device,
+            checkpoint_path=cfg.condmdi_unconditional_ckpt,
+            guidance_scale=cfg.diff_guidance,
+            ddim_steps=cfg.ddim_steps,
+        )
+
     for model_name in models:
         if not model_name.startswith("composite_"):
             continue
@@ -1025,6 +1247,7 @@ def main() -> None:
             include_ends=cfg.keyframe_include_ends,
             keyframe_topk=cfg.keyframe_topk,
             keyframe_budget_ratio=cfg.keyframe_budget_ratio,
+            ddim_steps=cfg.ddim_steps,
         )
 
     all_results = {
@@ -1043,6 +1266,7 @@ def main() -> None:
             models=models,
             ar_source=ar_source,
             composite_strategies=composite_strategies,
+            condmdi_text_strategies=condmdi_text_strategies,
             loader=loader,
             eval_wrapper=eval_wrapper,
             top_k=top_k,

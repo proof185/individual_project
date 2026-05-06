@@ -12,6 +12,18 @@ import clip
 from condmdi_adapter import load_external_condmdi_runtime, looks_like_condmdi_checkpoint
 
 
+def _resolve_existing_path(path: str, anchors: list[str]) -> str:
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+
+    candidates = [os.path.abspath(os.path.join(anchor, path)) for anchor in anchors]
+    candidates.append(os.path.abspath(path))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
 def encode_text_with_tokens(clip_model, texts: List[str], normalize: bool = True):
     """Encode text into pooled CLIP embeddings and per-token features."""
     device = next(clip_model.parameters()).device
@@ -102,6 +114,7 @@ def load_inbetween_model(
     cfg,
     device: str = 'cuda',
     inbetween_ckpt_path: str | None = None,
+    ddim_steps: int = 50,
 ):
     """Load external CondMDI runtime and normalization stats from a checkpoint."""
     from keyframe_selectors import build_keyframe_selector
@@ -121,6 +134,7 @@ def load_inbetween_model(
             local_mean=mean,
             local_std=std,
             device=device,
+            ddim_steps=ddim_steps,
         )
         clip_model = setup_clip_model(device)
         print(f'Loaded external CondMDI runtime from {inbetween_ckpt_path}')
@@ -186,12 +200,20 @@ def load_inbetween_model(
         return runtime_model
 
     if external_inbetween_ckpt_path:
-        resolved_external_path = os.path.abspath(os.path.join(os.path.dirname(inbetween_ckpt_path), external_inbetween_ckpt_path))
+        resolved_external_path = _resolve_existing_path(
+            str(external_inbetween_ckpt_path),
+            anchors=[
+                os.path.dirname(os.path.abspath(inbetween_ckpt_path)),
+                os.path.dirname(os.path.abspath(__file__)),
+                os.getcwd(),
+            ],
+        )
         inbetween_model, diff_inbetween = load_external_condmdi_runtime(
             checkpoint_path=resolved_external_path,
             local_mean=mean,
             local_std=std,
             device=device,
+            ddim_steps=ddim_steps,
         )
         inbetween_model = _attach_selector(inbetween_model, selector_state, saved_cfg)
         inbetween_model.eval()

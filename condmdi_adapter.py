@@ -123,9 +123,11 @@ class ExternalCondMDIDiffusionAdapter:
         device: torch.device,
         max_frames: int,
         reconstruction_model=None,
+        use_ddim: bool = True,
     ):
         self.model = model
         self.diffusion = diffusion
+        self.use_ddim = use_ddim
         self.reconstruction_model = reconstruction_model if reconstruction_model is not None else model
         self.condmdi_root = condmdi_root
         self.local_mean = local_mean.to(device).view(1, -1, 1, 1)
@@ -168,9 +170,9 @@ class ExternalCondMDIDiffusionAdapter:
         r_pos = torch.cumsum(r_pos, dim=-2)
         r_pos[..., 1] = seq[..., 3]
 
-        output[:, :1] = rot_ang.unsqueeze(1).unsqueeze(2)
-        output[:, 1:2] = r_pos[..., 0].unsqueeze(1).unsqueeze(2)
-        output[:, 2:3] = r_pos[..., 2].unsqueeze(1).unsqueeze(2)
+        output[:, :1] = rot_ang.unsqueeze(1)
+        output[:, 1:2] = r_pos[..., 0].unsqueeze(1)
+        output[:, 2:3] = r_pos[..., 2].unsqueeze(1)
         return output
 
     def _absolute_to_relative_root(self, data: torch.Tensor) -> torch.Tensor:
@@ -194,8 +196,8 @@ class ExternalCondMDIDiffusionAdapter:
         rel_rot[:, :, :-1, :] = gl_rot[:, :, 1:, :] - gl_rot[:, :, :-1, :]
 
         output[:, :1] = rel_rot.permute(0, 3, 1, 2)
-        output[:, 1:2] = rel_pos[..., 0].unsqueeze(1).unsqueeze(2)
-        output[:, 2:3] = rel_pos[..., 2].unsqueeze(1).unsqueeze(2)
+        output[:, 1:2] = rel_pos[..., 0].unsqueeze(1)
+        output[:, 2:3] = rel_pos[..., 2].unsqueeze(1)
         return output
 
     def _normalize_local_to_abs(self, x0_local: torch.Tensor) -> torch.Tensor:
@@ -344,7 +346,9 @@ class ExternalCondMDIDiffusionAdapter:
                 'obs_mask': obs_mask,
             }
 
-            sampled_abs = self.diffusion.p_sample_loop(
+            sample_fn = self.diffusion.ddim_sample_loop if self.use_ddim else self.diffusion.p_sample_loop
+            extra = {"eta": 0.0} if self.use_ddim else {}
+            sampled_abs = sample_fn(
                 self.model,
                 (batch_size, self.model.njoints, self.model.nfeats, self.max_frames),
                 clip_denoised=False,
@@ -355,8 +359,59 @@ class ExternalCondMDIDiffusionAdapter:
                 dump_steps=None,
                 noise=None,
                 const_noise=False,
+                **extra,
             )
             sampled_abs = sampled_abs[:, :, :, :time_steps]
+            return self._denormalize_abs_to_local(sampled_abs)
+
+    @torch.no_grad()
+    def sample_text_local(
+        self,
+        text_prompts,
+        lengths: torch.Tensor,
+        guidance_scale: float = 2.5,
+    ) -> torch.Tensor:
+        if isinstance(text_prompts, str):
+            texts = [text_prompts]
+        else:
+            texts = list(text_prompts)
+        batch_size = len(texts)
+        if batch_size == 0:
+            raise ValueError('text_prompts must contain at least one prompt.')
+
+        lengths = lengths.to(self.device).long()
+        if lengths.shape != (batch_size,):
+            raise ValueError(f'lengths must have shape {(batch_size,)}, got {tuple(lengths.shape)}.')
+        if int(lengths.max().item()) > self.max_frames:
+            raise ValueError(f'Requested {int(lengths.max().item())} frames, but CondMDI supports at most {self.max_frames} frames.')
+
+        frame_ids = torch.arange(self.max_frames, device=self.device).unsqueeze(0)
+        valid_mask = frame_ids < lengths.unsqueeze(1)
+        model_kwargs = {
+            'y': {
+                'mask': valid_mask.unsqueeze(1).unsqueeze(1),
+                'lengths': lengths,
+                'text': texts,
+                'text_scale': torch.ones(batch_size, device=self.device) * float(guidance_scale),
+            },
+        }
+
+        with _temporary_condmdi_imports(self.condmdi_root):
+            sample_fn = self.diffusion.ddim_sample_loop if self.use_ddim else self.diffusion.p_sample_loop
+            extra = {"eta": 0.0} if self.use_ddim else {}
+            sampled_abs = sample_fn(
+                self.model,
+                (batch_size, self.model.njoints, self.model.nfeats, self.max_frames),
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                skip_timesteps=0,
+                init_image=None,
+                progress=False,
+                dump_steps=None,
+                noise=None,
+                const_noise=False,
+                **extra,
+            )
             return self._denormalize_abs_to_local(sampled_abs)
 
 
@@ -365,6 +420,7 @@ def load_external_condmdi_runtime(
     local_mean: torch.Tensor,
     local_std: torch.Tensor,
     device: str = 'cuda',
+    ddim_steps: int = 50,
 ):
     condmdi_root = infer_condmdi_root(checkpoint_path)
     target_device = torch.device(device)
@@ -377,6 +433,18 @@ def load_external_condmdi_runtime(
         model_args = json.load(f)
 
     with _temporary_condmdi_imports(condmdi_root):
+        smpl_stub = types.ModuleType('model.smpl')
+        smpl_stub.JOINTSTYPE_ROOT = {'a2m': 0, 'smpl': 0, 'a2mpl': 0, 'vibe': 0, 'vertices': 0}
+
+        class _StubSMPL:
+            def eval(self):
+                return self
+
+            def to(self, device):
+                return self
+
+        smpl_stub.SMPL = _StubSMPL
+        sys.modules['model.smpl'] = smpl_stub
         rotation2xyz_module = importlib.import_module('model.rotation2xyz')
 
         class _NoOpSMPLModel:
@@ -403,6 +471,11 @@ def load_external_condmdi_runtime(
         load_saved_model = model_util_module.load_saved_model
         ClassifierFreeSampleModel = cfg_sampler_module.ClassifierFreeSampleModel
 
+        model_args.setdefault('keyframe_conditioned', False)
+        model_args.setdefault('keyframe_selection_scheme', 'none')
+        model_args.setdefault('zero_keyframe_loss', False)
+        model_args['use_ddim'] = True
+        model_args['timestep_respacing'] = f'ddim{ddim_steps}'
         args = types.SimpleNamespace(**model_args)
         dummy_data = types.SimpleNamespace(dataset=types.SimpleNamespace(num_actions=1))
         condmdi_model, condmdi_diffusion = create_model_and_diffusion(args, dummy_data)
@@ -434,6 +507,7 @@ def load_external_condmdi_runtime(
         device=target_device,
         max_frames=max_frames,
         reconstruction_model=condmdi_model,
+        use_ddim=True,
     )
     condmdi_model.keyframe_selector = None
     condmdi_model.is_external_condmdi = True

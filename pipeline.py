@@ -85,6 +85,54 @@ def _build_parser() -> argparse.ArgumentParser:
     arlm_generate.add_argument("--arlm-vq-ckpt", type=str, default=None)
     arlm_generate.add_argument("--arlm-gpt-ckpt", type=str, default=None)
 
+    compare_selectors = sub.add_parser(
+        "compare-selectors",
+        help="Run every selector strategy on the same prompt and AR motion for side-by-side comparison",
+    )
+    compare_selectors.add_argument("--prompt", type=str, required=True)
+    compare_selectors.add_argument(
+        "--selectors",
+        type=str,
+        default=None,
+        help="Comma-separated selector modes to run (default: all)",
+    )
+    compare_selectors.add_argument("--budget-ratio", type=float, default=None)
+    compare_selectors.add_argument("--inbetween-ckpt", type=str, default=None)
+    compare_selectors.add_argument("--t2mgpt-root", type=str, default="D:/Projects/T2M-GPT")
+    compare_selectors.add_argument("--arlm-vq-ckpt", type=str, default=None)
+    compare_selectors.add_argument("--arlm-gpt-ckpt", type=str, default=None)
+    compare_selectors.add_argument("--out-dir", type=str, default="samples/compare_selectors")
+    compare_selectors.add_argument("--out-name", type=str, default="compare")
+    compare_selectors.add_argument("--device", type=str, default=None)
+    compare_selectors.add_argument("--stride", type=int, default=None)
+    compare_selectors.add_argument("--interval-ms", type=int, default=None)
+
+    ghost = sub.add_parser(
+        "ghost",
+        help="Render a static ghost-trail image of a motion sequence for dissertation/paper figures",
+    )
+    ghost.add_argument("motion_file", type=str)
+    ghost.add_argument("--keyframe-indices", type=str, default=None)
+    ghost.add_argument("--n-ghosts", type=int, default=None)
+    ghost.add_argument("--stride", type=int, default=None)
+    ghost.add_argument("--spread", type=float, default=None)
+    ghost.add_argument("--out", type=str, default=None)
+    ghost.add_argument("--elev", type=float, default=None)
+    ghost.add_argument("--azim", type=float, default=None)
+    ghost.add_argument("--figsize", type=str, default=None)
+    ghost.add_argument("--dpi", type=int, default=None)
+    ghost.add_argument("--bone-lw", type=float, default=None)
+    ghost.add_argument("--joint-size", type=float, default=None)
+    ghost.add_argument("--regular-color", type=str, default=None)
+    ghost.add_argument("--keyframe-color", type=str, default=None)
+    ghost.add_argument("--no-floor", action="store_true")
+    ghost.add_argument("--floor-tiles", type=int, default=None)
+    ghost.add_argument("--show-axes", action="store_true")
+    ghost.add_argument("--title", type=str, default=None)
+    ghost.add_argument("--normalized", action="store_true")
+    ghost.add_argument("--mean-path", type=str, default=None)
+    ghost.add_argument("--std-path", type=str, default=None)
+
     visualize = sub.add_parser("visualize", help="Visualize an existing motion .npy file")
     visualize.add_argument("motion_file", type=str)
     visualize.add_argument("--normalized", action="store_true")
@@ -141,6 +189,17 @@ def main() -> None:
     if args.command == "arlm-generate":
         script_args = _args_to_script_flags(args, {"command"})
         _run("arlm_generate.py", script_args)
+        return
+
+    if args.command == "compare-selectors":
+        script_args = _args_to_script_flags(args, {"command"})
+        _run("run_compare_selectors.py", script_args)
+        return
+
+    if args.command == "ghost":
+        script_args = [args.motion_file]
+        script_args += _args_to_script_flags(args, {"command", "motion_file"})
+        _run("visualize_ghost.py", script_args)
         return
 
     if args.command == "visualize":
